@@ -272,7 +272,9 @@ export function toolLabel(name: string, input: Record<string, unknown>): string 
 /** Pemeriksaan ringan sebelum query James dijalankan (penjaga utamanya tetap transaksi READ ONLY + peran baca). */
 export function checkSql(q: string): string | null {
   const s = q.trim().replace(/;\s*$/, '');
-  if (!/^(select|with)\b/i.test(s)) return 'Only a single SELECT (or WITH … SELECT) statement is allowed.';
+  // A query may open with comments or a parenthesis: "(select …) union (select …)", "-- note\nselect …".
+  const head = s.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|\()+/, '');
+  if (!/^(select|with|values)\b/i.test(head)) return 'Only a single SELECT (or WITH … SELECT) statement is allowed.';
   // Titik koma di dalam teks ('a;b') atau komentar bukan pemisah perintah.
   if (s.replace(/'(?:[^']|'')*'/g, "''").replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '').includes(';')) return 'Only one statement is allowed: remove the semicolons.';
   const bare = s.replace(/'(?:[^']|'')*'/g, "''");
@@ -413,7 +415,10 @@ export async function runTool(name: string, input: Record<string, unknown>, ctx:
       break;
     }
     case 'get_item': {
-      const id = String(input.id);
+      const id = String(input.id ?? '').trim();
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+        throw new Error(`get_item needs the result_id (a uuid) from search/timeline/sheet_rows, not "${id.slice(0, 80)}". To find a file by its name, use search with the name.`);
+      }
       if (input.type === 'file') rows = (await sql`select ai.get_file(${id}::uuid) as item`)[0]?.item;
       else if (input.type === 'document') rows = (await sql`select ai.get_document(${id}::uuid) as item`)[0]?.item;
       else rows = (await sql`select ai.get_sheet_row(${id}::uuid) as item`)[0]?.item;

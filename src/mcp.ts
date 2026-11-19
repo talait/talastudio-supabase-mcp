@@ -101,7 +101,7 @@ async function callTool(name: string, args: Record<string, unknown>, token: stri
       return { content: [text(await contextText())] };
     case 'sql_query': {
       const q = String(args.sql ?? '').trim().replace(/;\s*$/, '');
-      if (!/^(select|with)\b/i.test(q)) throw new ToolError('Only a single SELECT (or WITH … SELECT) statement is allowed.');
+      if (!/^(select|with|values)\b/i.test(q.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|\()+/, ''))) throw new ToolError('Only a single SELECT (or WITH … SELECT) statement is allowed.');
       if (q.replace(/'(?:[^']|'')*'/g, "''").replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '').includes(';')) throw new ToolError('One statement only: remove the semicolons.');
       if (/\b(pg_sleep|pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|lo_import|lo_export|lo_get|dblink\w*|set_config|pg_terminate_backend|pg_cancel_backend|http_\w+|net\.\w+)\s*\(/i.test(q)) throw new ToolError('That function is not allowed.');
       const max = typeof args.max_rows === 'number' ? Math.floor(args.max_rows) : 200;
