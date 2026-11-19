@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "talastudio-supabase-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  // Only the custom domain; no *.workers.dev address.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "mcp.talastudio.net", "custom_domain": true }],
+  // The same Hyperdrive configs as the workspace Worker (talastudio-workspace).
+  "hyperdrive": [
+    // "talastudio-db": role ts_chatbot (read)
+    { "binding": "HYPERDRIVE", "id": "80852d9c563b4f799dd78522bfa30a9a", "localConnectionString": "postgresql://postgres:postgres@127.0.0.1:5432/postgres" },
+    // "talastudio-db-app": role ts_app, caching off (tokens, call log)
+    { "binding": "HYPERDRIVE_APP", "id": "496d964d34cd4a3c977e785aadf45183", "localConnectionString": "postgresql://postgres:postgres@127.0.0.1:5432/postgres" }
+  ],
+  // Variables/secrets set in the dashboard survive deploys.
+  "keep_vars": true,
+  "vars": {
+    "MCP_HOST": "mcp.talastudio.net",
+    "WORKSPACE_ORIGIN": "https://workspace.talastudio.net"
+  }
+  // Dashboard > Worker > Settings > Variables and Secrets (look_at_file reads Drive previews):
+  //   Secret: GOOGLE_SA_KEY  (same value as on the talastudio-workspace Worker), or
+  //           GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REFRESH_TOKEN
+}
