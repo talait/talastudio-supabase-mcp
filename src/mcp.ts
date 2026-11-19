@@ -9,7 +9,8 @@ import { CORS, MCP_ORIGIN, hideSecretKeys, json, redact } from './lib';
 
 const VERSION = '2026-11-19.1';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
-const OUT_CHARS = 90_000;
+// Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
+const OUT_CHARS = 60_000;
 
 // James tools that only read. remember/forget/run_sync (write) and query_database (replaced by sql_query) are left out.
 const FROM_JAMES = ['overview', 'search', 'meaning_search', 'business_trace', 'knowledge_graph', 'timeline', 'recent', 'get_item',
