@@ -11,7 +11,7 @@ export async function register(req: Request) {
   const bad = uris.find((u) => !allowedRedirect(u));
   if (bad) return json({ error: 'invalid_redirect_uri', error_description: `Redirect not allowed: ${bad}. Only Claude (claude.ai, claude.com) and localhost.` }, 400);
   const name = String(b.client_name ?? 'Claude').slice(0, 120);
-  const [{ id }] = (await sqlApp`select mcp.register_client(${name}, ${uris}::text[]) as id`) as unknown as { id: string }[];
+  const [{ id }] = (await sqlApp`select mcp.register_client(${name}, (select array_agg(u) from jsonb_array_elements_text(${JSON.stringify(uris)}::jsonb) u)) as id`) as unknown as { id: string }[];
   return json({
     client_id: id, client_id_issued_at: Math.floor(Date.now() / 1000), client_name: name, redirect_uris: uris,
     token_endpoint_auth_method: 'none', grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'],
