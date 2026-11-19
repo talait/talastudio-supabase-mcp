@@ -1,8 +1,8 @@
 # TalaStudio MCP server
 
 The TalaStudio connector for Claude: a Cloudflare Worker at **`https://mcp.talastudio.net/mcp`** that lets the owners' Claude
-accounts read all TalaStudio company data (read-only). Who may connect is the list in Supabase `core.settings` key
-`access.mcp` (19 Nov 2026: ejo@talaliving.com, evin@talaliving.com).
+accounts read all TalaStudio company data (read-only). Who may connect: every company Google account whose domain is in
+Supabase `core.settings` `access.mcp_domains` (talaliving.com, talastudio.net), plus single emails in `access.mcp`.
 
 - Guide for the owners (what it is, how to install): Claude Doc "Konektor TalaStudio untuk Claude".
 - Technical notes, rules and admin tasks: [docs/mcp-connector.md](docs/mcp-connector.md).
