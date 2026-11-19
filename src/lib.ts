@@ -39,7 +39,7 @@ export async function resolveClient(clientId: string): Promise<McpClient | null>
       const doc = (await r.json()) as { client_id?: string; client_name?: string; redirect_uris?: unknown };
       const uris = Array.isArray(doc.redirect_uris) ? doc.redirect_uris.filter((x): x is string => typeof x === 'string' && allowedRedirect(x)) : [];
       if (doc.client_id !== clientId || !uris.length) return null;
-      await sqlApp`select mcp.save_cimd_client(${clientId}, ${String(doc.client_name ?? new URL(clientId).hostname)}, (select array_agg(u) from jsonb_array_elements_text(${JSON.stringify(uris)}::jsonb) u))`;
+      await sqlApp`select mcp.save_cimd_client(${clientId}, ${String(doc.client_name ?? new URL(clientId).hostname)}, (select array_agg(u) from jsonb_array_elements_text(${sqlApp.json(uris)}::jsonb) u))`;
       return { client_id: clientId, name: doc.client_name ?? new URL(clientId).hostname, redirect_uris: uris };
     } catch { return null; }
   }
