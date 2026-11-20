@@ -8,7 +8,7 @@ import { saveFile } from './drive';
  * Same tools and data as James (as an admin), plus free read-only SQL over every data schema. Nothing can be changed.
  */
 
-const VERSION = '2026-11-20.9';
+const VERSION = '2026-11-20.10';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 // Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
 const OUT_CHARS = 60_000;
@@ -296,9 +296,11 @@ async function callTool(name: string, args: Record<string, unknown>, token: stri
       let pending = list;
       if (list.length && turn.chat) {
         const names = list.map((f) => String(f.name ?? '').trim()).filter(Boolean);
-        const done = (await sqlApp`select mcp.chat_saved_names(${token}, ${turn.chat}::uuid,
-          (select coalesce(array_agg(x), '{}') from jsonb_array_elements_text(${sqlApp.json(names)}::jsonb) x)) as n`) as unknown as { n: string[] | null }[];
-        const saved = new Set((done[0]?.n ?? []).map((x) => x.toLowerCase()));
+        // Arrays go both ways as JSON: through Hyperdrive a text[] parameter or result is not converted.
+        const [{ n }] = (await sqlApp`select to_jsonb(mcp.chat_saved_names(${token}, ${turn.chat}::uuid,
+          (select coalesce(array_agg(x), '{}') from jsonb_array_elements_text(${sqlApp.json(names)}::jsonb) x))) as n`) as unknown as { n: unknown }[];
+        const savedNames = (typeof n === 'string' ? JSON.parse(n) : n) as string[] | null;
+        const saved = new Set((Array.isArray(savedNames) ? savedNames : []).map((x) => String(x).toLowerCase()));
         pending = list.filter((f) => !saved.has(String(f.name ?? '').trim().toLowerCase()));
       }
       const parts = [turn.chat ? 'Turn kept for the team.' : 'Noted (send user_message so the turn is kept).'];
