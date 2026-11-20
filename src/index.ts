@@ -9,7 +9,7 @@ import { token } from './oauth-token';
  * Only these addresses exist; everything else is 404. The browser login/consent step lives on the workspace
  * (workspace.talastudio.net/oauth/consent, behind Cloudflare Access).
  */
-const VERSION = '2026-11-20.4';
+const VERSION = '2026-11-20.5';
 
 async function route(req: Request): Promise<Response> {
   const url = new URL(req.url);
