@@ -14,7 +14,7 @@ Tidak pernah keluar: kunci dan rahasia (`core.app_secrets`, `core.settings` asli
 Data perusahaan tidak bisa diubah, dikirim, disetujui, atau dihapus. Yang boleh ditulis hanya konteks bersama (keputusan 20 Nov 2026):
 - `remember` / `forget`: catatan tim (sama dengan catatan yang dibaca James di setiap chat) atau catatan pribadi pengguna.
 - `save_file`: file yang diberikan pengguna ke Claude dan file buatan Claude disimpan apa adanya ke Drive `TALASTUDIO ASSETS/_CLAUDE/<nama>/<tanggal>`, tercatat di `mcp.saved_files`, lalu ikut terindeks seperti file Drive lain.
-- `save_chat`: ringkasan percakapan disimpan sebagai dokumen `ai_chat` (bisa dicari James dan tim).
+- `save_chat`: seluruh percakapan (ringkasan + transkrip kata per kata) disimpan sebagai dokumen `ai_chat` (bisa dicari James dan tim) dan sebagai satu file `Chat <tanggal> - <judul>.md` per percakapan di Drive `_CLAUDE`, diperbarui setiap kali disimpan. Claude diminta menyimpan setelah jawaban pertama lalu setiap jawaban berikutnya, karena Claude desktop tidak bisa direkam ekstensi Chrome. Server MCP sendiri tidak bisa membaca percakapan; yang tersimpan adalah yang dikirim Claude.
 
 ## Cara kerja
 - Server: `https://mcp.talastudio.net/mcp`, Worker Cloudflare sendiri `talastudio-supabase-mcp` (repo `talait/talastudio-supabase-mcp`), deploy otomatis lewat Workers Builds. Host ini tanpa Cloudflare Access karena yang memanggil server Claude; selain `/mcp` dan alamat OAuth, semua 404. Halaman izin tetap di workspace (repo `talait/talastudio-supabase`).
