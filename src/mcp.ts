@@ -8,7 +8,7 @@ import { saveFile } from './drive';
  * Same tools and data as James (as an admin), plus free read-only SQL over every data schema. Nothing can be changed.
  */
 
-const VERSION = '2026-11-20.5';
+const VERSION = '2026-11-20.6';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 // Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
 const OUT_CHARS = 60_000;
@@ -85,6 +85,30 @@ const OWN_TOOLS: Tool[] = [
     },
   },
   {
+    name: 'upload_attachment',
+    title: 'Save original files to Drive',
+    description: 'Save ORIGINAL files to Google Drive TALASTUDIO ASSETS/_CLAUDE/<person>/<date> exactly as they are (PDF, Excel, Word, images, drawings, any type, up to 95 MB): every file the user attaches to this chat (kind "input") and every file you create in your code sandbox (kind "output"). You only see a read-out of an attachment, so its bytes cannot go through a tool argument: this tool returns one-time upload addresses and the curl command for each file. Run those commands in your code sandbox right away (the attachment is a real file there, usually under /mnt/user-data/uploads/). If the sandbox cannot connect, give the user the links: opening one in a browser lets them drop the file. Use save_file only for text you write yourself.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        files: {
+          type: 'array', minItems: 1, maxItems: 20,
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'File name with extension as it should appear in Drive, e.g. "Quotation CN Glass.pdf".' },
+              path: { type: 'string', description: 'Where the file is in your code sandbox, e.g. "/mnt/user-data/uploads/Quotation CN Glass.pdf".' },
+              kind: { type: 'string', enum: ['input', 'output'], description: 'input = attached by the user; output = made by you.' },
+              description: { type: 'string', description: 'One line: what the file is.' },
+            },
+            required: ['name'],
+          },
+        },
+      },
+      required: ['files'],
+    },
+  },
+  {
     name: 'save_chat',
     title: 'Finish this turn',
     description: 'Every TalaStudio tool call already saves the user\'s message and your previous answer (fields user_message / previous_answer). Call save_chat as the LAST step of a turn in which you used TalaStudio, with final_answer = the answer you are about to give, word for word, so the conversation is complete. Add a summary when the conversation reaches a result (what was asked, the answer with key numbers and sources, decisions, files). Nothing is overwritten: every message and every summary is kept.',
@@ -99,7 +123,7 @@ const OWN_TOOLS: Tool[] = [
     },
   },
 ];
-const WRITE_TOOLS = new Set(['remember', 'forget', 'save_file', 'save_chat']);
+const WRITE_TOOLS = new Set(['remember', 'forget', 'save_file', 'upload_attachment', 'save_chat']);
 
 // Every tool call carries the conversation so far, so it is saved without relying on a separate call.
 const TURN_FIELDS = {
@@ -125,7 +149,7 @@ function toolList(): Tool[] {
     ...t,
     inputSchema: withTurn(t.inputSchema),
     annotations: WRITE_TOOLS.has(t.name)
-      ? { readOnlyHint: false, destructiveHint: t.name === 'forget', idempotentHint: false, openWorldHint: t.name === 'save_file' }
+      ? { readOnlyHint: false, destructiveHint: t.name === 'forget', idempotentHint: false, openWorldHint: t.name === 'save_file' || t.name === 'upload_attachment' }
       : { ...RO, ...(t.name === 'look_at_file' ? { openWorldHint: true } : {}) },
   }));
 }
@@ -137,7 +161,7 @@ How to work:
 - Investigate like an auditor: check at least two independent sources (e.g. chat + spreadsheet + file), build the timeline, look for counter-evidence, and separate proven facts from guesses. Read the records behind any summary number.
 - Dates: the database stores UTC; report in WIB (Asia/Jakarta). Data is collected from 1 Nov 2026 (some sources earlier) and updated automatically; say how fresh the data is when it matters.
 - Cite the links returned by the tools. Never invent numbers: every figure comes from a tool result.
-- Shared context: every conversation that uses TalaStudio is kept for the team, complete and append-only. Every tool call carries chat_title, user_message (the user's latest message, word for word) and, on the first call of a turn, previous_answer (your previous answer, word for word). End every turn in which you used TalaStudio with save_chat(final_answer = your answer word for word). Save durable facts and decisions with remember (team). Save every file the user gives you and every deliverable you make with save_file (kind input/output; files are never overwritten) and share the link. Do this without being asked; mention it in one short line at most.
+- Shared context: every conversation that uses TalaStudio is kept for the team, complete and append-only. Every tool call carries chat_title, user_message (the user's latest message, word for word) and, on the first call of a turn, previous_answer (your previous answer, word for word). End every turn in which you used TalaStudio with save_chat(final_answer = your answer word for word). Save durable facts and decisions with remember (team). Files: for every file the user attaches (PDF, Excel, Word, image, drawing, anything) and every file you create in your code sandbox, call upload_attachment and run the curl commands it returns in your code sandbox, so the ORIGINAL file is kept in Drive and read by the ingestion; if the sandbox cannot reach the address, give the user the links to drop the files themselves. Text you write yourself (reports, tables, notes) goes with save_file. Files are never overwritten; share the Drive links. Do this without being asked; mention it in one short line at most.
 - Company records cannot be changed, sent or approved through this connector (only notes, chat summaries and files in _CLAUDE are written); secrets (keys, tokens, pairing codes) are never shown.`;
 
 async function contextText(token: string): Promise<string> {
@@ -180,8 +204,25 @@ async function callTool(name: string, args: Record<string, unknown>, token: stri
       return { content: [text(ok ? `Note #${args.id} removed.` : `No ${scope} note #${args.id} found.`)] };
     }
     case 'save_file': {
-      const f = await saveFile(token, args as Parameters<typeof saveFile>[1]);
+      const f = await saveFile(token, { ...(args as Parameters<typeof saveFile>[1]), chat_key: typeof args.chat_key === 'string' && args.chat_key ? args.chat_key : turn.chat ?? undefined });
       return { content: [text(JSON.stringify({ saved: f.name, folder: f.folder, link: f.link, size_bytes: f.size }))] };
+    }
+    case 'upload_attachment': {
+      const list = (Array.isArray(args.files) ? args.files : []).slice(0, 20) as { name?: unknown; path?: unknown; kind?: unknown; description?: unknown }[];
+      if (!list.length) throw new ToolError('List the files: [{ name, path, kind }].');
+      const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+      const out: string[] = [];
+      for (const f of list) {
+        const name = String(f.name ?? '').trim();
+        const [{ r }] = (await sqlApp`select mcp.upload_ticket_new(${token}, ${name}, ${f.kind === 'output' ? 'output' : 'input'},
+          ${typeof f.description === 'string' ? f.description : null}, ${turn.chat}::uuid) as r`) as unknown as { r: unknown }[];
+        const { ticket } = (typeof r === 'string' ? JSON.parse(r) : r) as { ticket: string };
+        const url = `${MCP_ORIGIN}/upload/${ticket}`;
+        const path = typeof f.path === 'string' && f.path.trim() ? f.path.trim() : `/mnt/user-data/uploads/${name}`;
+        out.push(`${name}\n  command: curl -sS --fail-with-body -T ${q(path)} ${q(url)}\n  browser link (if the sandbox cannot connect): ${url}`);
+      }
+      // Not passed through redact(): these are our own one-time addresses, and Claude needs them intact.
+      return { content: [{ type: 'text', text: `Run these in your code sandbox now (bash). Each prints JSON with the Drive link of the original file. Links work once and expire in 60 minutes.\n\n${out.join('\n\n')}\n\nIf curl cannot connect (network off or the host not allowed), give the user the browser links to drop the files, and tell them their Claude admin can allow mcp.talastudio.net under Settings > Capabilities (network egress, allowed domains) so it happens automatically next time.` }] };
     }
     case 'save_chat': {
       const files = Array.isArray(args.files) ? (args.files as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 50) : [];

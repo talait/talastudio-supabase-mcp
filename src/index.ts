@@ -3,13 +3,14 @@ import { CORS, WORKSPACE_ORIGIN, authServerMetadata, json, resourceMetadata } fr
 import { mcpGet, mcpPost } from './mcp';
 import { register } from './oauth-register';
 import { token } from './oauth-token';
+import { upload } from './upload';
 
 /**
  * TalaStudio MCP server (mcp.talastudio.net): the owners' Claude connector.
- * Only these addresses exist; everything else is 404. The browser login/consent step lives on the workspace
+ * Only these addresses exist (plus /upload/<ticket>, the one-time file upload addresses); everything else is 404. The browser login/consent step lives on the workspace
  * (workspace.talastudio.net/oauth/consent, behind Cloudflare Access).
  */
-const VERSION = '2026-11-20.5';
+const VERSION = '2026-11-20.6';
 
 async function route(req: Request): Promise<Response> {
   const url = new URL(req.url);
@@ -33,6 +34,8 @@ async function route(req: Request): Promise<Response> {
     if (req.method === 'GET') return mcpGet();
     return new Response(null, { status: 405, headers: { ...CORS, Allow: 'POST' } });
   }
+  const up = /^\/upload\/([^/]+)$/.exec(p);
+  if (up) return upload(req, up[1]);
   if (p === '/' && req.method === 'GET') return json({ name: 'TalaStudio MCP server', version: VERSION, mcp: `${url.origin}/mcp` });
   return new Response('Not found', { status: 404 });
 }
