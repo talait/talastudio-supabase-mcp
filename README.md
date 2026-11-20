@@ -19,7 +19,7 @@ Supabase `core.settings` `access.mcp_domains` (talaliving.com, talastudio.net), 
 ## Tools
 
 `company_context` (knowledge, team notes and the person's own notes), `sql_query` (read-only SQL over every data schema), `database_schema`, `look_at_file` (returns the picture),
-shared context: `remember` / `forget` (team notes James reads too, or the person's own notes), `save_file` (Drive `TALASTUDIO ASSETS/_CLAUDE/<person>/<date>`, as is), `save_chat` (summary searchable by James and the team),
+shared context: `remember` / `forget` (team notes James reads too, or the person's own notes), `save_file` (Drive `TALASTUDIO ASSETS/_CLAUDE/<person>/<date>`, as is), `save_chat` (end of a turn: final answer + summary). Every tool call also carries `chat_title`, `user_message` and `previous_answer`, appended to `mcp.chats` / `mcp.chat_turns` (append-only) and published as an `ai_chat` document,
 plus James' read-only tools: overview, search, meaning_search, business_trace, knowledge_graph, timeline, recent, get_item,
 sheet_rows, list_tabs, collection_context, pc_files, staff_directory, workspace_activity, website_visitors, ai_prompts,
 system_log, hr_documents, past_chats. Company records are never changed; nothing sends or approves.

@@ -1,10 +1,11 @@
 import { sqlApp } from './db';
-import { ensureFolder, googleToken, putChunk, startResumable } from './james/google';
+import { ensureFolder, putChunk, startResumable } from './james/google';
 
 /**
  * Files from Claude chats go to Drive TALASTUDIO ASSETS/_CLAUDE/<person>/<YYYY-MM-DD WIB>/ as they are (no conversion),
  * uploaded by the workspace service account, then logged in mcp.saved_files. The Drive sync picks them up like any
- * other file in the Shared Drive, so their content becomes searchable for James and everyone.
+ * other file in the Shared Drive, so their content becomes searchable for James and everyone. Files are never
+ * overwritten: saving the same name again makes a new file next to the old one.
  */
 const MAX_BYTES = 20 * 1024 * 1024;
 
@@ -59,13 +60,3 @@ export async function saveFile(token: string, a: {
   return { id, name: f.name, link: f.webViewLink, drive_file: f.id, folder: `TALASTUDIO ASSETS/_CLAUDE/${person}/${day}`, size: bytes.byteLength };
 }
 
-/** Replace the content of a text file saved earlier (the conversation transcript is one file, updated on every save). */
-export async function updateText(fileId: string, text: string): Promise<{ link?: string }> {
-  const token = await googleToken();
-  const r = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}?uploadType=media&supportsAllDrives=true&fields=id,webViewLink`, {
-    method: 'PATCH', headers: { authorization: `Bearer ${token}`, 'content-type': 'text/markdown; charset=UTF-8' }, body: text,
-  });
-  if (!r.ok) throw new Error(`Google Drive update ${r.status}: ${(await r.text()).slice(0, 200)}`);
-  const f = (await r.json()) as { webViewLink?: string };
-  return { link: f.webViewLink };
-}

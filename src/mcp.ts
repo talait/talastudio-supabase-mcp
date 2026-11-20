@@ -1,14 +1,14 @@
 import { sql, sqlApp, ownerQuery } from './db';
 import { filePreview, runTool, tools as jamesTools } from './james/tools';
 import { CORS, MCP_ORIGIN, hideSecretKeys, json, redact } from './lib';
-import { saveFile, updateText } from './drive';
+import { saveFile } from './drive';
 
 /**
  * TalaStudio MCP server (Streamable HTTP, JSON responses, stateless) for the owners' Claude accounts.
  * Same tools and data as James (as an admin), plus free read-only SQL over every data schema. Nothing can be changed.
  */
 
-const VERSION = '2026-11-20.2';
+const VERSION = '2026-11-20.3';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 // Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
 const OUT_CHARS = 60_000;
@@ -86,22 +86,32 @@ const OWN_TOOLS: Tool[] = [
   },
   {
     name: 'save_chat',
-    title: 'Save this conversation',
-    description: 'Save this whole conversation to the shared record (James and the team can search it; the full transcript is also kept as one file in Drive _CLAUDE). Call it after your first answer in every conversation where TalaStudio tools were used, then again with the SAME key after each later answer, so the record always holds the conversation so far. "transcript" = every user message and every one of your answers, in order and word for word ("**User:** …" / "**Claude:** …"; leave out tool calls and raw tool output). "summary" = what was asked, the answer with key numbers and sources, decisions and next steps, files saved. Returns a key: reuse it.',
+    title: 'Finish this turn',
+    description: 'Every TalaStudio tool call already saves the user\'s message and your previous answer (fields user_message / previous_answer). Call save_chat as the LAST step of a turn in which you used TalaStudio, with final_answer = the answer you are about to give, word for word, so the conversation is complete. Add a summary when the conversation reaches a result (what was asked, the answer with key numbers and sources, decisions, files). Nothing is overwritten: every message and every summary is kept.',
     inputSchema: {
       type: 'object',
       properties: {
-        title: { type: 'string' },
-        summary: { type: 'string', description: 'Short summary (markdown).' },
-        transcript: { type: 'string', description: 'The whole conversation so far, word for word, in order.' },
-        key: { type: 'string', description: 'Key from an earlier save_chat of this same conversation; empty for a new one.' },
+        final_answer: { type: 'string', description: 'Your answer for this turn, word for word.' },
+        summary: { type: 'string', description: 'Optional summary of the conversation so far (markdown).' },
         files: { type: 'array', items: { type: 'string' }, description: 'Drive links of files saved in this conversation.' },
       },
-      required: ['title', 'summary', 'transcript'],
+      required: ['final_answer'],
     },
   },
 ];
 const WRITE_TOOLS = new Set(['remember', 'forget', 'save_file', 'save_chat']);
+
+// Every tool call carries the conversation so far, so it is saved without relying on a separate call.
+const TURN_FIELDS = {
+  chat_title: { type: 'string', description: 'Short title of this conversation, the same on every call (e.g. "Vendor risk Nov 2026").' },
+  user_message: { type: 'string', description: "The user's latest message, word for word (including what they pasted)." },
+  previous_answer: { type: 'string', description: 'Your previous answer in this conversation, word for word. Send it on the FIRST tool call of a turn only; leave it empty on the first turn and on later calls of the same turn.' },
+};
+const withTurn = (schema: Record<string, unknown>) => {
+  const props = (schema.properties ?? {}) as Record<string, unknown>;
+  const req = Array.isArray(schema.required) ? (schema.required as string[]) : [];
+  return { ...schema, type: 'object', properties: { ...props, ...TURN_FIELDS }, required: [...new Set([...req, 'chat_title', 'user_message'])] };
+};
 
 function toolList(): Tool[] {
   const fromJames = jamesTools
@@ -113,8 +123,9 @@ function toolList(): Tool[] {
     }));
   return [...OWN_TOOLS, ...fromJames].map((t) => ({
     ...t,
+    inputSchema: withTurn(t.inputSchema),
     annotations: WRITE_TOOLS.has(t.name)
-      ? { readOnlyHint: false, destructiveHint: t.name === 'forget', idempotentHint: t.name === 'save_chat', openWorldHint: t.name === 'save_file' }
+      ? { readOnlyHint: false, destructiveHint: t.name === 'forget', idempotentHint: false, openWorldHint: t.name === 'save_file' }
       : { ...RO, ...(t.name === 'look_at_file' ? { openWorldHint: true } : {}) },
   }));
 }
@@ -126,7 +137,7 @@ How to work:
 - Investigate like an auditor: check at least two independent sources (e.g. chat + spreadsheet + file), build the timeline, look for counter-evidence, and separate proven facts from guesses. Read the records behind any summary number.
 - Dates: the database stores UTC; report in WIB (Asia/Jakarta). Data is collected from 1 Nov 2026 (some sources earlier) and updated automatically; say how fresh the data is when it matters.
 - Cite the links returned by the tools. Never invent numbers: every figure comes from a tool result.
-- Shared context: every conversation that uses TalaStudio is kept for the team. After your first answer call save_chat (title, summary, the full transcript so far) and after each later answer call it again with the same key. Save durable facts and decisions with remember (team). Save files the user gives you and the deliverables you make with save_file (kind input/output) and share the link. Do this without being asked; mention it in one short line.
+- Shared context: every conversation that uses TalaStudio is kept for the team, complete and append-only. Every tool call carries chat_title, user_message (the user's latest message, word for word) and, on the first call of a turn, previous_answer (your previous answer, word for word). End every turn in which you used TalaStudio with save_chat(final_answer = your answer word for word). Save durable facts and decisions with remember (team). Save every file the user gives you and every deliverable you make with save_file (kind input/output; files are never overwritten) and share the link. Do this without being asked; mention it in one short line at most.
 - Company records cannot be changed, sent or approved through this connector (only notes, chat summaries and files in _CLAUDE are written); secrets (keys, tokens, pairing codes) are never shown.`;
 
 async function contextText(token: string): Promise<string> {
@@ -151,7 +162,9 @@ async function contextText(token: string): Promise<string> {
 
 class ToolError extends Error {}
 
-async function callTool(name: string, args: Record<string, unknown>, token: string, email: string): Promise<{ content: unknown[]; isError?: boolean }> {
+type Turn = { session: string | null; title: string | null; chat: string | null };
+
+async function callTool(name: string, args: Record<string, unknown>, token: string, email: string, turn: Turn): Promise<{ content: unknown[]; isError?: boolean }> {
   const text = (v: string) => ({ type: 'text', text: redact(v) });
   switch (name) {
     case 'company_context':
@@ -171,35 +184,11 @@ async function callTool(name: string, args: Record<string, unknown>, token: stri
       return { content: [text(JSON.stringify({ saved: f.name, folder: f.folder, link: f.link, size_bytes: f.size }))] };
     }
     case 'save_chat': {
-      const title = String(args.title ?? '').trim() || 'Claude conversation';
-      const summary = String(args.summary ?? '').trim();
-      const transcript = String(args.transcript ?? '').trim();
       const files = Array.isArray(args.files) ? (args.files as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 50) : [];
-      const compose = (link?: string) => [
-        `## Summary\n${summary || '(none)'}`,
-        files.length ? `## Files\n${files.map((l) => `- ${l}`).join('\n')}` : '',
-        link ? `Full transcript: ${link}` : '',
-        transcript ? `## Transcript\n${transcript}` : '',
-      ].filter(Boolean).join('\n\n');
-      const save = async (key: string, body: string, link?: string) => {
-        const [{ k }] = (await sqlApp`select mcp.save_chat(${token}, ${key}, ${title}, ${body},
-          ${sqlApp.json({ files, transcript_chars: transcript.length, ...(link ? { transcript_file: link } : {}) } as never)}::jsonb) as k`) as unknown as { k: string }[];
-        return k;
-      };
-      let key = await save(String(args.key ?? ''), compose());
-      let link: string | undefined;
-      if (transcript) {
-        // The whole conversation, also as one Drive file per conversation (updated in place), so nothing is cut off.
-        const doc = `# ${title}\n\n${email} · ${new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Jakarta', dateStyle: 'medium', timeStyle: 'short' }).format(new Date())} WIB · via the TalaStudio connector\n\n${compose()}`;
-        const [{ f }] = (await sqlApp`select mcp.chat_transcript_file(${token}, ${key}) as f`) as unknown as { f: string | null }[];
-        if (f) link = (await updateText(f, doc)).link;
-        else {
-          const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
-          link = (await saveFile(token, { name: `Chat ${day} - ${title.replace(/[\\/:*?"<>|]+/g, ' ').slice(0, 80)}.md`, text: doc, kind: 'output', description: 'transcript', chat_key: key })).link;
-        }
-        if (link) key = await save(key, compose(link), link);
-      }
-      return { content: [text(JSON.stringify({ saved: true, key, transcript_file: link ?? null, note: 'Searchable by James and the team. Call save_chat again with this key after your next answer.' }))] };
+      const summary = [String(args.summary ?? '').trim(), files.length ? `Files:\n${files.map((l) => `- ${l}`).join('\n')}` : ''].filter(Boolean).join('\n\n');
+      const [{ c }] = (await sqlApp`select mcp.chat_finish(${token}, ${turn.session}, ${turn.title}, ${turn.chat}::uuid,
+        ${String(args.final_answer ?? '')}, ${summary || null}) as c`) as unknown as { c: string }[];
+      return { content: [text(JSON.stringify({ saved: true, chat_id: c, note: 'Conversation saved (append-only); James and the team can search it.' }))] };
     }
     case 'sql_query': {
       const q = String(args.sql ?? '').trim().replace(/;\s*$/, '');
@@ -238,7 +227,7 @@ type Rpc = { jsonrpc?: string; id?: string | number | null; method?: string; par
 const ok = (id: Rpc['id'], result: unknown) => ({ jsonrpc: '2.0', id, result });
 const err = (id: Rpc['id'], code: number, message: string) => ({ jsonrpc: '2.0', id: id ?? null, error: { code, message } });
 
-async function handle(m: Rpc, token: string, email: string): Promise<unknown | null> {
+async function handle(m: Rpc, token: string, email: string, session: string | null): Promise<unknown | null> {
   if (!m || typeof m.method !== 'string') return err(m?.id, -32600, 'Invalid request');
   const isNote = m.id === undefined || m.id === null;
   switch (m.method) {
@@ -258,16 +247,26 @@ async function handle(m: Rpc, token: string, email: string): Promise<unknown | n
     case 'prompts/list': return ok(m.id, { prompts: [] });
     case 'tools/call': {
       const name = String(m.params?.name ?? '');
-      const args = (m.params?.arguments && typeof m.params.arguments === 'object' ? m.params.arguments : {}) as Record<string, unknown>;
+      const raw = (m.params?.arguments && typeof m.params.arguments === 'object' ? m.params.arguments : {}) as Record<string, unknown>;
+      const { chat_title, user_message, previous_answer, ...args } = raw;
+      const turn: Turn = { session, title: typeof chat_title === 'string' ? chat_title.slice(0, 200) : null, chat: null };
+      // Save the conversation first (append-only); a failure here never blocks the tool.
+      if (name !== 'save_chat' && (user_message || previous_answer)) {
+        try {
+          const [{ c }] = (await sqlApp`select mcp.chat_log(${token}, ${session}, ${turn.title}, ${typeof user_message === 'string' ? user_message : null},
+            ${typeof previous_answer === 'string' ? previous_answer : null}, ${name}, null) as c`) as unknown as { c: string | null }[];
+          turn.chat = c;
+        } catch { /* logging must not break the tool */ }
+      }
       const t0 = Date.now();
       let res: { content: unknown[]; isError?: boolean };
       let error: string | null = null;
-      try { res = await callTool(name, args, token, email); } catch (e) {
+      try { res = await callTool(name, args, token, email, turn); } catch (e) {
         error = (e as Error).message || 'failed';
         res = { content: [{ type: 'text', text: redact(`Error: ${error}`) }], isError: true };
       }
       // File contents are not copied into the call log (the file itself is on Drive and in mcp.saved_files).
-      const slim = name === 'save_chat' ? { ...args, transcript: `[${String(args.transcript ?? '').length} chars]` } : name === 'save_file' ? { ...args, text: args.text ? `[${String(args.text).length} chars]` : undefined, content_base64: args.content_base64 ? `[${String(args.content_base64).length} chars]` : undefined } : args;
+      const slim = name === 'save_chat' ? { ...args, final_answer: `[${String(args.final_answer ?? '').length} chars]` } : name === 'save_file' ? { ...args, text: args.text ? `[${String(args.text).length} chars]` : undefined, content_base64: args.content_base64 ? `[${String(args.content_base64).length} chars]` : undefined } : args;
       const logged = JSON.stringify(slim).length > 4000 ? { truncated: JSON.stringify(slim).slice(0, 4000) } : slim;
       await sqlApp`select mcp.log_call(${token}, ${name}, ${sqlApp.json(logged as never)}::jsonb, ${Date.now() - t0}, ${!error}, ${error})`.catch(() => undefined);
       return ok(m.id, res);
@@ -295,12 +294,17 @@ export async function mcpPost(req: Request) {
   if (!e) return unauthorized('Token expired or not allowed');
   let body: unknown;
   try { body = await req.json(); } catch { return json(err(null, -32700, 'Parse error'), 400); }
+  // A session id groups the tool calls of one Claude conversation (the client sends it back on every request).
+  const msgs = (Array.isArray(body) ? body : [body]) as Rpc[];
+  const isInit = msgs.some((m) => m?.method === 'initialize');
+  const session = req.headers.get('mcp-session-id') || (isInit ? crypto.randomUUID() : null);
+  const sid: Record<string, string> = isInit && session ? { 'Mcp-Session-Id': session } : {};
   if (Array.isArray(body)) {
-    const out = (await Promise.all(body.map((m) => handle(m as Rpc, token, e)))).filter((x) => x !== null);
-    return out.length ? json(out) : new Response(null, { status: 202, headers: CORS });
+    const out = (await Promise.all(msgs.map((m) => handle(m, token, e, session)))).filter((x) => x !== null);
+    return out.length ? json(out, 200, sid) : new Response(null, { status: 202, headers: { ...CORS, ...sid } });
   }
-  const out = await handle(body as Rpc, token, e);
-  return out === null ? new Response(null, { status: 202, headers: CORS }) : json(out);
+  const out = await handle(body as Rpc, token, e, session);
+  return out === null ? new Response(null, { status: 202, headers: { ...CORS, ...sid } }) : json(out, 200, sid);
 }
 
 export function mcpGet() {
