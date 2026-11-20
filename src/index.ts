@@ -10,7 +10,7 @@ import { upload } from './upload';
  * Only these addresses exist (plus /upload/<ticket>, the one-time file upload addresses); everything else is 404. The browser login/consent step lives on the workspace
  * (workspace.talastudio.net/oauth/consent, behind Cloudflare Access).
  */
-const VERSION = '2026-11-20.6';
+const VERSION = '2026-11-20.7';
 
 async function route(req: Request): Promise<Response> {
   const url = new URL(req.url);
