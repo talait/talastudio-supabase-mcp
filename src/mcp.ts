@@ -1,14 +1,14 @@
 import { sql, sqlApp, ownerQuery } from './db';
 import { filePreview, runTool, tools as jamesTools } from './james/tools';
 import { CORS, MCP_ORIGIN, hideSecretKeys, json, redact } from './lib';
-import { saveFile } from './drive';
+import { saveFile, updateText } from './drive';
 
 /**
  * TalaStudio MCP server (Streamable HTTP, JSON responses, stateless) for the owners' Claude accounts.
  * Same tools and data as James (as an admin), plus free read-only SQL over every data schema. Nothing can be changed.
  */
 
-const VERSION = '2026-11-20.1';
+const VERSION = '2026-11-20.2';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 // Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
 const OUT_CHARS = 60_000;
@@ -87,16 +87,17 @@ const OWN_TOOLS: Tool[] = [
   {
     name: 'save_chat',
     title: 'Save this conversation',
-    description: 'Save a summary of this conversation to the shared record (searchable by James and the team, like the other captured AI chats). Call it at the end of any conversation that produced findings, decisions or files, and again with the same key when it continues. Body in the user\'s language: what was asked; the answer with its key numbers and sources; decisions and next steps with owners; links of files saved. Returns a key: reuse it for later updates and in save_file.',
+    description: 'Save this whole conversation to the shared record (James and the team can search it; the full transcript is also kept as one file in Drive _CLAUDE). Call it after your first answer in every conversation where TalaStudio tools were used, then again with the SAME key after each later answer, so the record always holds the conversation so far. "transcript" = every user message and every one of your answers, in order and word for word ("**User:** …" / "**Claude:** …"; leave out tool calls and raw tool output). "summary" = what was asked, the answer with key numbers and sources, decisions and next steps, files saved. Returns a key: reuse it.',
     inputSchema: {
       type: 'object',
       properties: {
         title: { type: 'string' },
-        summary: { type: 'string', description: 'The full summary (markdown).' },
+        summary: { type: 'string', description: 'Short summary (markdown).' },
+        transcript: { type: 'string', description: 'The whole conversation so far, word for word, in order.' },
         key: { type: 'string', description: 'Key from an earlier save_chat of this same conversation; empty for a new one.' },
         files: { type: 'array', items: { type: 'string' }, description: 'Drive links of files saved in this conversation.' },
       },
-      required: ['title', 'summary'],
+      required: ['title', 'summary', 'transcript'],
     },
   },
 ];
@@ -125,7 +126,7 @@ How to work:
 - Investigate like an auditor: check at least two independent sources (e.g. chat + spreadsheet + file), build the timeline, look for counter-evidence, and separate proven facts from guesses. Read the records behind any summary number.
 - Dates: the database stores UTC; report in WIB (Asia/Jakarta). Data is collected from 1 Nov 2026 (some sources earlier) and updated automatically; say how fresh the data is when it matters.
 - Cite the links returned by the tools. Never invent numbers: every figure comes from a tool result.
-- Shared context: what you learn here should not be lost. Save durable facts and decisions with remember (team). Save files the user gives you and the deliverables you make with save_file (kind input/output) and share the link. At the end of a conversation with findings, decisions or files, call save_chat with a full summary (reuse its key if the conversation continues). Tell the user briefly what you saved.
+- Shared context: every conversation that uses TalaStudio is kept for the team. After your first answer call save_chat (title, summary, the full transcript so far) and after each later answer call it again with the same key. Save durable facts and decisions with remember (team). Save files the user gives you and the deliverables you make with save_file (kind input/output) and share the link. Do this without being asked; mention it in one short line.
 - Company records cannot be changed, sent or approved through this connector (only notes, chat summaries and files in _CLAUDE are written); secrets (keys, tokens, pairing codes) are never shown.`;
 
 async function contextText(token: string): Promise<string> {
@@ -170,11 +171,35 @@ async function callTool(name: string, args: Record<string, unknown>, token: stri
       return { content: [text(JSON.stringify({ saved: f.name, folder: f.folder, link: f.link, size_bytes: f.size }))] };
     }
     case 'save_chat': {
+      const title = String(args.title ?? '').trim() || 'Claude conversation';
+      const summary = String(args.summary ?? '').trim();
+      const transcript = String(args.transcript ?? '').trim();
       const files = Array.isArray(args.files) ? (args.files as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 50) : [];
-      const body = String(args.summary ?? '') + (files.length ? `\n\nFiles:\n${files.map((l) => `- ${l}`).join('\n')}` : '');
-      const [{ k }] = (await sqlApp`select mcp.save_chat(${token}, ${String(args.key ?? '')}, ${String(args.title ?? '')}, ${body},
-        ${sqlApp.json({ files } as never)}::jsonb) as k`) as unknown as { k: string }[];
-      return { content: [text(JSON.stringify({ saved: true, key: k, note: 'Searchable by James and the team. Reuse this key to update the summary.' }))] };
+      const compose = (link?: string) => [
+        `## Summary\n${summary || '(none)'}`,
+        files.length ? `## Files\n${files.map((l) => `- ${l}`).join('\n')}` : '',
+        link ? `Full transcript: ${link}` : '',
+        transcript ? `## Transcript\n${transcript}` : '',
+      ].filter(Boolean).join('\n\n');
+      const save = async (key: string, body: string, link?: string) => {
+        const [{ k }] = (await sqlApp`select mcp.save_chat(${token}, ${key}, ${title}, ${body},
+          ${sqlApp.json({ files, transcript_chars: transcript.length, ...(link ? { transcript_file: link } : {}) } as never)}::jsonb) as k`) as unknown as { k: string }[];
+        return k;
+      };
+      let key = await save(String(args.key ?? ''), compose());
+      let link: string | undefined;
+      if (transcript) {
+        // The whole conversation, also as one Drive file per conversation (updated in place), so nothing is cut off.
+        const doc = `# ${title}\n\n${email} · ${new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Jakarta', dateStyle: 'medium', timeStyle: 'short' }).format(new Date())} WIB · via the TalaStudio connector\n\n${compose()}`;
+        const [{ f }] = (await sqlApp`select mcp.chat_transcript_file(${token}, ${key}) as f`) as unknown as { f: string | null }[];
+        if (f) link = (await updateText(f, doc)).link;
+        else {
+          const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
+          link = (await saveFile(token, { name: `Chat ${day} - ${title.replace(/[\\/:*?"<>|]+/g, ' ').slice(0, 80)}.md`, text: doc, kind: 'output', description: 'transcript', chat_key: key })).link;
+        }
+        if (link) key = await save(key, compose(link), link);
+      }
+      return { content: [text(JSON.stringify({ saved: true, key, transcript_file: link ?? null, note: 'Searchable by James and the team. Call save_chat again with this key after your next answer.' }))] };
     }
     case 'sql_query': {
       const q = String(args.sql ?? '').trim().replace(/;\s*$/, '');
@@ -242,7 +267,7 @@ async function handle(m: Rpc, token: string, email: string): Promise<unknown | n
         res = { content: [{ type: 'text', text: redact(`Error: ${error}`) }], isError: true };
       }
       // File contents are not copied into the call log (the file itself is on Drive and in mcp.saved_files).
-      const slim = name === 'save_file' ? { ...args, text: args.text ? `[${String(args.text).length} chars]` : undefined, content_base64: args.content_base64 ? `[${String(args.content_base64).length} chars]` : undefined } : args;
+      const slim = name === 'save_chat' ? { ...args, transcript: `[${String(args.transcript ?? '').length} chars]` } : name === 'save_file' ? { ...args, text: args.text ? `[${String(args.text).length} chars]` : undefined, content_base64: args.content_base64 ? `[${String(args.content_base64).length} chars]` : undefined } : args;
       const logged = JSON.stringify(slim).length > 4000 ? { truncated: JSON.stringify(slim).slice(0, 4000) } : slim;
       await sqlApp`select mcp.log_call(${token}, ${name}, ${sqlApp.json(logged as never)}::jsonb, ${Date.now() - t0}, ${!error}, ${error})`.catch(() => undefined);
       return ok(m.id, res);
