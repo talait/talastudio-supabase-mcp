@@ -8,7 +8,7 @@ import { saveFile } from './drive';
  * Same tools and data as James (as an admin), plus free read-only SQL over every data schema. Nothing can be changed.
  */
 
-const VERSION = '2026-11-20.6';
+const VERSION = '2026-11-20.7';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 // Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
 const OUT_CHARS = 60_000;
@@ -109,6 +109,20 @@ const OWN_TOOLS: Tool[] = [
     },
   },
   {
+    name: 'claude_chats',
+    title: 'Claude conversations kept in TalaStudio',
+    description: 'Find and read the Claude conversations kept through this connector (shared context: every turn, summary and saved files). scope "mine" (default) = the signed-in person\'s own conversations; "team" = everyone\'s. Give query to search titles, summaries and messages; give chat_id to read one conversation in full. For James chats use past_chats; for emails, Google Chat, files and everything else use search / sql_query.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Words to look for (optional).' },
+        scope: { type: 'string', enum: ['mine', 'team'] },
+        chat_id: { type: 'string', description: 'Read this conversation in full.' },
+        limit: { type: 'integer', minimum: 1, maximum: 50 },
+      },
+    },
+  },
+  {
     name: 'save_chat',
     title: 'Finish this turn',
     description: 'Every TalaStudio tool call already saves the user\'s message and your previous answer (fields user_message / previous_answer). Call save_chat as the LAST step of a turn in which you used TalaStudio, with final_answer = the answer you are about to give, word for word, so the conversation is complete. Add a summary when the conversation reaches a result (what was asked, the answer with key numbers and sources, decisions, files). Nothing is overwritten: every message and every summary is kept.',
@@ -142,7 +156,8 @@ function toolList(): Tool[] {
     .filter((t) => FROM_JAMES.includes(t.name))
     .map((t) => ({
       name: t.name,
-      description: String(t.description ?? '').replace(/query_database/g, 'sql_query').replace(/\bthe user\b/g, 'the reader'),
+      description: String(t.description ?? '').replace(/query_database/g, 'sql_query').replace(/\bthe user\b/g, 'the reader')
+        + (t.name === 'past_chats' ? ' Only James chats; Claude conversations kept through this connector are in claude_chats.' : ''),
       inputSchema: t.input_schema as unknown as Record<string, unknown>,
     }));
   return [...OWN_TOOLS, ...fromJames].map((t) => ({
@@ -161,7 +176,7 @@ How to work:
 - Investigate like an auditor: check at least two independent sources (e.g. chat + spreadsheet + file), build the timeline, look for counter-evidence, and separate proven facts from guesses. Read the records behind any summary number.
 - Dates: the database stores UTC; report in WIB (Asia/Jakarta). Data is collected from 1 Nov 2026 (some sources earlier) and updated automatically; say how fresh the data is when it matters.
 - Cite the links returned by the tools. Never invent numbers: every figure comes from a tool result.
-- Shared context: every conversation that uses TalaStudio is kept for the team, complete and append-only. Every tool call carries chat_title, user_message (the user's latest message, word for word) and, on the first call of a turn, previous_answer (your previous answer, word for word). End every turn in which you used TalaStudio with save_chat(final_answer = your answer word for word). Save durable facts and decisions with remember (team). Files: for every file the user attaches (PDF, Excel, Word, image, drawing, anything) and every file you create in your code sandbox, call upload_attachment and run the curl commands it returns in your code sandbox, so the ORIGINAL file is kept in Drive and read by the ingestion; if the sandbox cannot reach the address, give the user the links to drop the files themselves. Text you write yourself (reports, tables, notes) goes with save_file. Files are never overwritten; share the Drive links. Do this without being asked; mention it in one short line at most.
+- Shared context: every conversation that uses TalaStudio is kept for the team, complete and append-only. Every tool call carries chat_title, user_message (the user's latest message, word for word) and, on the first call of a turn, previous_answer (your previous answer, word for word). End every turn in which you used TalaStudio with save_chat(final_answer = your answer word for word). Save durable facts and decisions with remember (team). Earlier Claude conversations of the team: claude_chats. Files: for every file the user attaches (PDF, Excel, Word, image, drawing, anything) and every file you create in your code sandbox, call upload_attachment and run the curl commands it returns in your code sandbox, so the ORIGINAL file is kept in Drive and read by the ingestion; if the sandbox cannot reach the address, give the user the links to drop the files themselves. Text you write yourself (reports, tables, notes) goes with save_file. Files are never overwritten; share the Drive links. Do this without being asked; mention it in one short line at most.
 - Company records cannot be changed, sent or approved through this connector (only notes, chat summaries and files in _CLAUDE are written); secrets (keys, tokens, pairing codes) are never shown.`;
 
 async function contextText(token: string): Promise<string> {
@@ -206,6 +221,19 @@ async function callTool(name: string, args: Record<string, unknown>, token: stri
     case 'save_file': {
       const f = await saveFile(token, { ...(args as Parameters<typeof saveFile>[1]), chat_key: typeof args.chat_key === 'string' && args.chat_key ? args.chat_key : turn.chat ?? undefined });
       return { content: [text(JSON.stringify({ saved: f.name, folder: f.folder, link: f.link, size_bytes: f.size }))] };
+    }
+    case 'claude_chats': {
+      const id = typeof args.chat_id === 'string' ? args.chat_id.trim() : '';
+      if (id) {
+        if (!/^[0-9a-f-]{36}$/i.test(id)) throw new ToolError('chat_id is the uuid from a claude_chats list.');
+        const [{ r }] = (await sqlApp`select mcp.chat_read(${token}, ${id}::uuid) as r`) as unknown as { r: unknown }[];
+        const v = typeof r === 'string' ? r : JSON.stringify(r);
+        return { content: [text(v.length > OUT_CHARS ? v.slice(0, OUT_CHARS) + '\n[CUT OFF: the conversation is longer.]' : v)] };
+      }
+      const [{ r }] = (await sqlApp`select mcp.chat_search(${token}, ${typeof args.query === 'string' ? args.query : null},
+        ${args.scope === 'team' ? 'team' : 'mine'}, ${typeof args.limit === 'number' ? Math.floor(args.limit) : 10}) as r`) as unknown as { r: unknown }[];
+      const v = typeof r === 'string' ? r : JSON.stringify(r);
+      return { content: [text(v === '[]' ? `No ${args.scope === 'team' ? 'team' : 'own'} Claude conversations found${args.query ? ` for "${args.query}"` : ''}.` : v)] };
     }
     case 'upload_attachment': {
       const list = (Array.isArray(args.files) ? args.files : []).slice(0, 20) as { name?: unknown; path?: unknown; kind?: unknown; description?: unknown }[];
@@ -313,7 +341,7 @@ async function handle(m: Rpc, token: string, email: string, session: string | nu
       // First real use (20 Nov): Claude sent the user's messages but never its own answers. Every result reminds it
       // to finish the turn with save_chat, so the last answer is kept too.
       if (name !== 'save_chat' && Array.isArray(res.content)) {
-        res.content.push({ type: 'text', text: '[TalaStudio keeps this conversation: before you finish this reply, call save_chat with final_answer = your full answer.]' });
+        res.content.push({ type: 'text', text: '[TalaStudio keeps this conversation. Before you finish this reply: (1) if the user attached files in this chat (look in /mnt/user-data/uploads/) that you have not sent with upload_attachment yet, call upload_attachment now and run its curl commands, so the original files are kept; (2) call save_chat with final_answer = your full answer.]' });
       }
       return ok(m.id, res);
     }
