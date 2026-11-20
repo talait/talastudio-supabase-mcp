@@ -8,7 +8,7 @@ import { saveFile } from './drive';
  * Same tools and data as James (as an admin), plus free read-only SQL over every data schema. Nothing can be changed.
  */
 
-const VERSION = '2026-11-20.3';
+const VERSION = '2026-11-20.4';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 // Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
 const OUT_CHARS = 60_000;

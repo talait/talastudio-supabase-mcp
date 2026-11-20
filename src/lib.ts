@@ -64,7 +64,8 @@ export const authServerMetadata = () => ({
   code_challenge_methods_supported: ['S256'],
   token_endpoint_auth_methods_supported: ['none'],
   scopes_supported: [MCP_SCOPE],
-  client_id_metadata_document_supported: true,
+  // Off until tested with Claude's own metadata document: Claude then registers dynamically (tested end to end).
+  client_id_metadata_document_supported: false,
   service_documentation: `${WORKSPACE_ORIGIN}/`,
 });
 
