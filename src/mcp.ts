@@ -1,13 +1,14 @@
 import { sql, sqlApp, ownerQuery } from './db';
 import { filePreview, runTool, tools as jamesTools } from './james/tools';
 import { CORS, MCP_ORIGIN, hideSecretKeys, json, redact } from './lib';
+import { saveFile } from './drive';
 
 /**
  * TalaStudio MCP server (Streamable HTTP, JSON responses, stateless) for the owners' Claude accounts.
  * Same tools and data as James (as an admin), plus free read-only SQL over every data schema. Nothing can be changed.
  */
 
-const VERSION = '2026-11-19.1';
+const VERSION = '2026-11-20.1';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 // Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
 const OUT_CHARS = 60_000;
@@ -53,7 +54,53 @@ const OWN_TOOLS: Tool[] = [
     description: 'Get the picture of an image, render, drawing or PDF (first page) so you can look at it yourself: colour/finish checks, defects in production photos, what a drawing shows, comparing a render with a sample. id = a file result_id (uuid) from search/timeline/pc_files/get_item, or a Google Drive file id.',
     inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
   },
+  {
+    name: 'remember',
+    title: 'Save to shared memory',
+    description: 'Save a durable fact, decision or correction to the shared memory. scope "team" (default) = a team note that James and every Claude connected to TalaStudio read in every conversation (e.g. "Vendor CN GLASS invoices in RMB, not IDR", "EJO approves all PR above Rp10 jt"). scope "me" = the signed-in person\'s own memory (their preferences). One fact per call, in plain words, max 1000 characters. Do not save secrets, passwords or one-off chatter.',
+    inputSchema: { type: 'object', properties: { note: { type: 'string' }, scope: { type: 'string', enum: ['team', 'me'] } }, required: ['note'] },
+  },
+  {
+    name: 'forget',
+    title: 'Remove from shared memory',
+    description: 'Remove a team note (scope "team") or one of the person\'s own notes (scope "me") by its #id from company_context. Only when the user asks or the note is wrong.',
+    inputSchema: { type: 'object', properties: { id: { type: 'integer' }, scope: { type: 'string', enum: ['team', 'me'] } }, required: ['id'] },
+  },
+  {
+    name: 'save_file',
+    title: 'Save a file to Drive',
+    description: 'Save a file to Google Drive TALASTUDIO ASSETS/_CLAUDE/<person>/<date> as it is, so the team (and James) can find and open it. Use it for files the user gives you in this chat (kind "input") and for deliverables you make: reports, tables, CSV, drafts, code, images (kind "output"). Send "text" for text files (md, csv, html, json, txt) or "content_base64" for any file. Name it with its extension. Max 20 MB. Returns the Drive link: give it to the user.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'File name with extension, e.g. "Vendor risk Nov 2026.md".' },
+        text: { type: 'string', description: 'Content of a text file.' },
+        content_base64: { type: 'string', description: 'Content of any file, base64.' },
+        mime: { type: 'string', description: 'Optional media type; guessed from the extension.' },
+        kind: { type: 'string', enum: ['input', 'output'], description: 'input = given by the user; output = made by Claude.' },
+        description: { type: 'string', description: 'One or two lines: what it is and which question it answers.' },
+        chat_key: { type: 'string', description: 'The key returned by save_chat, to tie the file to this conversation.' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'save_chat',
+    title: 'Save this conversation',
+    description: 'Save a summary of this conversation to the shared record (searchable by James and the team, like the other captured AI chats). Call it at the end of any conversation that produced findings, decisions or files, and again with the same key when it continues. Body in the user\'s language: what was asked; the answer with its key numbers and sources; decisions and next steps with owners; links of files saved. Returns a key: reuse it for later updates and in save_file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' },
+        summary: { type: 'string', description: 'The full summary (markdown).' },
+        key: { type: 'string', description: 'Key from an earlier save_chat of this same conversation; empty for a new one.' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Drive links of files saved in this conversation.' },
+      },
+      required: ['title', 'summary'],
+    },
+  },
 ];
+const WRITE_TOOLS = new Set(['remember', 'forget', 'save_file', 'save_chat']);
 
 function toolList(): Tool[] {
   const fromJames = jamesTools
@@ -63,29 +110,38 @@ function toolList(): Tool[] {
       description: String(t.description ?? '').replace(/query_database/g, 'sql_query').replace(/\bthe user\b/g, 'the reader'),
       inputSchema: t.input_schema as unknown as Record<string, unknown>,
     }));
-  return [...OWN_TOOLS, ...fromJames].map((t) => ({ ...t, annotations: { ...RO, ...(t.name === 'look_at_file' ? { openWorldHint: true } : {}) } }));
+  return [...OWN_TOOLS, ...fromJames].map((t) => ({
+    ...t,
+    annotations: WRITE_TOOLS.has(t.name)
+      ? { readOnlyHint: false, destructiveHint: t.name === 'forget', idempotentHint: t.name === 'save_chat', openWorldHint: t.name === 'save_file' }
+      : { ...RO, ...(t.name === 'look_at_file' ? { openWorldHint: true } : {}) },
+  }));
 }
 
-const INSTRUCTIONS = `TalaStudio connector (read-only). TalaStudio is the furniture design studio of Tala Living in Jepara, Indonesia. This connector gives the owners the whole company record: Drive files and their extracted contents, every spreadsheet row and its change history, email threads, Google Chat, WhatsApp chats that were allowed in, purchase requests/payments/vendors/projects (business_trace, knowledge_graph), the product catalog and approvals, the website CMS and visitors, social posts, GitHub, team PC files, the Google Workspace audit log, sync health, HR documents (hr_documents) and the AI cost log.
+const INSTRUCTIONS = `TalaStudio connector. TalaStudio is the furniture design studio of Tala Living in Jepara, Indonesia. This connector gives the owners the whole company record: Drive files and their extracted contents, every spreadsheet row and its change history, email threads, Google Chat, WhatsApp chats that were allowed in, purchase requests/payments/vendors/projects (business_trace, knowledge_graph), the product catalog and approvals, the website CMS and visitors, social posts, GitHub, team PC files, the Google Workspace audit log, sync health, HR documents (hr_documents) and the AI cost log.
 
 How to work:
 - Start with company_context once per conversation, then pick the right source. For a PR/payment/vendor/project start with business_trace; for "who/how many/total/compare" write SQL with sql_query (james views first; schema-qualified tables for anything else; database_schema to discover).
 - Investigate like an auditor: check at least two independent sources (e.g. chat + spreadsheet + file), build the timeline, look for counter-evidence, and separate proven facts from guesses. Read the records behind any summary number.
 - Dates: the database stores UTC; report in WIB (Asia/Jakarta). Data is collected from 1 Nov 2026 (some sources earlier) and updated automatically; say how fresh the data is when it matters.
 - Cite the links returned by the tools. Never invent numbers: every figure comes from a tool result.
-- Nothing can be sent, approved or changed through this connector; secrets (keys, tokens, pairing codes) are never shown.`;
+- Shared context: what you learn here should not be lost. Save durable facts and decisions with remember (team). Save files the user gives you and the deliverables you make with save_file (kind input/output) and share the link. At the end of a conversation with findings, decisions or files, call save_chat with a full summary (reuse its key if the conversation continues). Tell the user briefly what you saved.
+- Company records cannot be changed, sent or approved through this connector (only notes, chat summaries and files in _CLAUDE are written); secrets (keys, tokens, pairing codes) are never shown.`;
 
-async function contextText(): Promise<string> {
-  const [[{ s }], notes, know] = await Promise.all([
+async function contextText(token: string): Promise<string> {
+  const [[{ s }], notes, know, [{ mine }]] = await Promise.all([
     sql`select ai.james_schema() as s` as unknown as Promise<{ s: string }[]>,
     sql`select id, note, added_by from ai.james_notes_list(150)` as unknown as Promise<{ id: number; note: string; added_by: string }[]>,
     sql`select title, body from ai.james_knowledge_list()` as unknown as Promise<{ title: string; body: string }[]>,
+    sqlApp`select mcp.my_notes(${token}) as mine` as unknown as Promise<{ mine: unknown }[]>,
   ]);
+  const myNotes = ((typeof mine === 'string' ? JSON.parse(mine) : mine) ?? []) as { id: number; note: string }[];
   const now = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Jakarta', dateStyle: 'full', timeStyle: 'short' }).format(new Date());
   return [
     `Now: ${now} WIB.`,
     '# Company knowledge', know.map((k) => `## ${k.title}\n${k.body.trim()}`).join('\n\n'),
-    '# Team notes', notes.map((x) => `#${x.id} ${x.note} (from ${x.added_by.split('@')[0]})`).join('\n') || '(none)',
+    '# Team notes (shared memory; add with remember, remove with forget scope "team")', notes.map((x) => `#${x.id} ${x.note} (from ${x.added_by.split('@')[0]})`).join('\n') || '(none)',
+    '# Your own notes (scope "me")', myNotes.map((x) => `#${x.id} ${x.note}`).join('\n') || '(none)',
     '# Views in schema james (unqualified names in sql_query)', String(s ?? ''),
     '# Other schemas (schema-qualified in sql_query; use database_schema for columns)',
     'sheets (rows, tabs, row_changes = every spreadsheet row and its history) · media (files, file_contents, local_files = team PC files, pc_uploads, whatsapp_chats, devices) · ai (documents = emails/chats/posts/commits, chunks, prompt_log, runs = AI cost) · spine (events = every event from every source, event_links) · biz (refs, links, data_issues = purchases/payments/vendors) · kg (entities, facts) · product (catalog: collections, placements, asset_slots/versions, status_history) · cms (website content) · core (people, person_profiles, audit_log, sync_runs, sync_state) · hr (documents) · qa (tests, results, james_exam*) · public (ws_activity = Workspace audit log) · talastudio_visitor_tracker (website visits) · mcp (settings_public, calls = this connector\'s log).',
@@ -98,7 +154,28 @@ async function callTool(name: string, args: Record<string, unknown>, token: stri
   const text = (v: string) => ({ type: 'text', text: redact(v) });
   switch (name) {
     case 'company_context':
-      return { content: [text(await contextText())] };
+      return { content: [text(await contextText(token))] };
+    case 'remember': {
+      const scope = args.scope === 'me' ? 'me' : 'team';
+      const [{ id }] = (await sqlApp`select mcp.note_add(${token}, ${String(args.note ?? '')}, ${scope}) as id`) as unknown as { id: number }[];
+      return { content: [text(scope === 'me' ? `Saved to your own memory as #${id}.` : `Saved as team note #${id}: James and every connected Claude will see it.`)] };
+    }
+    case 'forget': {
+      const scope = args.scope === 'me' ? 'me' : 'team';
+      const [{ ok }] = (await sqlApp`select mcp.note_remove(${token}, ${Number(args.id)}, ${scope}) as ok`) as unknown as { ok: boolean }[];
+      return { content: [text(ok ? `Note #${args.id} removed.` : `No ${scope} note #${args.id} found.`)] };
+    }
+    case 'save_file': {
+      const f = await saveFile(token, args as Parameters<typeof saveFile>[1]);
+      return { content: [text(JSON.stringify({ saved: f.name, folder: f.folder, link: f.link, size_bytes: f.size }))] };
+    }
+    case 'save_chat': {
+      const files = Array.isArray(args.files) ? (args.files as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 50) : [];
+      const body = String(args.summary ?? '') + (files.length ? `\n\nFiles:\n${files.map((l) => `- ${l}`).join('\n')}` : '');
+      const [{ k }] = (await sqlApp`select mcp.save_chat(${token}, ${String(args.key ?? '')}, ${String(args.title ?? '')}, ${body},
+        ${sqlApp.json({ files } as never)}::jsonb) as k`) as unknown as { k: string }[];
+      return { content: [text(JSON.stringify({ saved: true, key: k, note: 'Searchable by James and the team. Reuse this key to update the summary.' }))] };
+    }
     case 'sql_query': {
       const q = String(args.sql ?? '').trim().replace(/;\s*$/, '');
       if (!/^(select|with|values)\b/i.test(q.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|\()+/, ''))) throw new ToolError('Only a single SELECT (or WITH … SELECT) statement is allowed.');
@@ -164,7 +241,9 @@ async function handle(m: Rpc, token: string, email: string): Promise<unknown | n
         error = (e as Error).message || 'failed';
         res = { content: [{ type: 'text', text: redact(`Error: ${error}`) }], isError: true };
       }
-      const logged = JSON.stringify(args).length > 4000 ? { truncated: JSON.stringify(args).slice(0, 4000) } : args;
+      // File contents are not copied into the call log (the file itself is on Drive and in mcp.saved_files).
+      const slim = name === 'save_file' ? { ...args, text: args.text ? `[${String(args.text).length} chars]` : undefined, content_base64: args.content_base64 ? `[${String(args.content_base64).length} chars]` : undefined } : args;
+      const logged = JSON.stringify(slim).length > 4000 ? { truncated: JSON.stringify(slim).slice(0, 4000) } : slim;
       await sqlApp`select mcp.log_call(${token}, ${name}, ${sqlApp.json(logged as never)}::jsonb, ${Date.now() - t0}, ${!error}, ${error})`.catch(() => undefined);
       return ok(m.id, res);
     }
