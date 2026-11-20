@@ -38,3 +38,8 @@ Data perusahaan tidak bisa diubah, dikirim, disetujui, atau dihapus. Yang boleh 
 
 ## Perbaikan keamanan yang ikut
 James `query_database` tidak boleh lagi memanggil fungsi skema lain (mis. `ai.hr_documents('email admin', …)`), yang sebelumnya bisa membuka dokumen HR untuk akun bukan admin.
+
+## Pengujian (20 Nov 2026)
+- Uji ujung-ke-ujung dari PC kantor sebagai `qa-bot@talaliving.com` (`app/src/sync/mcpTest.ts`): Cloudflare Access asli (token QA) → halaman izin → kode OAuth → token → semua tool, lalu token dicabut dan chat uji dihapus dari pencarian. Minta uji baru: `insert into qa.mcp_test_runs (note) values ('…')`; hasil per langkah di `qa.mcp_test_runs.results`.
+- Hasil run 3: **43/43 langkah lulus** — metadata, 401/404, registrasi (redirect Claude diterima, asing ditolak), izin, PKCE salah ditolak, kode tidak bisa dipakai ulang, sesi MCP, 27 tool, tabel rahasia & chat James orang lain tertutup, tulis lewat SQL ditolak, nilai mirip kunci disensor, `look_at_file` mengirim gambar, catatan pribadi simpan/hapus, `save_file` teks & base64 ke `_CLAUDE/qa-bot/<tanggal>`, `save_chat`, percakapan tersimpan berurutan dalam satu chat, refresh token + jeda 60 detik, token baru bekerja.
+- Belum teruji: sambungan dari aplikasi Claude sungguhan (Claude memakai registrasi dinamis yang sudah teruji; Client ID Metadata Document sengaja dimatikan) dan apakah Claude mengisi `user_message`/`previous_answer` di setiap tool.
