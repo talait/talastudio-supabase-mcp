@@ -9,7 +9,7 @@ import { openOriginal } from './download';
  * Same tools and data as James (as an admin), plus free read-only SQL over every data schema. Nothing can be changed.
  */
 
-const VERSION = '2026-11-23.3';
+const VERSION = '2026-11-23.4';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 // Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
 const OUT_CHARS = 60_000;
@@ -300,7 +300,7 @@ How to work:
 - Dates: the database stores UTC; report in WIB (Asia/Jakarta). Data is collected from 1 Nov 2026 (some sources earlier) and updated automatically; say how fresh the data is when it matters.
 - Cite the links returned by the tools. Never invent numbers: every figure comes from a tool result.
 - Shared context: every conversation is kept for the team, complete and append-only. In EVERY reply, whatever the user asks, call keep_turn first (with the attached files) and save_chat last. Every tool call carries chat_title, user_message (the user's latest message, word for word) and, on the first call of a turn, previous_answer (your previous answer, word for word). End every turn in which you used TalaStudio with save_chat(final_answer = your answer word for word). Save durable facts and decisions with remember (team). Earlier Claude conversations of the team: claude_chats. Files: for every file the user attaches (PDF, Excel, Word, image, drawing, anything) and every file you create in your code sandbox, call upload_attachment and run the curl commands it returns in your code sandbox, so the ORIGINAL file is kept in Drive and read by the ingestion; if the sandbox cannot reach the address, give the user the links to drop the files themselves. Text you write yourself (reports, tables, notes) goes with save_file. Files are never overwritten; share the Drive links. Do this without being asked; mention it in one short line at most.
-- Project spaces: a project's shared context lives in TalaStudio and is the same for every Claude account (Claude Projects cannot be shared between accounts). When the conversation is about a project (the user names it, or the Claude Project's instructions say so), call project_open first and follow its INSTRUCTIONS; read documents with project_read; save documents with project_write (always a new version), decisions with project_decide, project files with upload_attachment/save_file + project. Before you finish a piece of work, call session_end with a hand-over and, when the state changed, the updated brief. Hand over with links to the sources (files, tables, chats), never a retold summary in their place; open the linked sources before relying on a hand-over.
+- Project spaces: a project's shared context lives in TalaStudio and is the same for every Claude account (Claude Projects cannot be shared between accounts). The first tool result of each conversation brings the person's default project (INSTRUCTIONS + BRIEF); follow it when the question concerns that project, and call project_open for another project; read documents with project_read; save documents with project_write (always a new version), decisions with project_decide, project files with upload_attachment/save_file + project. Before you finish a piece of work, call session_end with a hand-over and, when the state changed, the updated brief. Hand over with links to the sources (files, tables, chats), never a retold summary in their place; open the linked sources before relying on a hand-over.
 - Originals, not previews: look_at_file is a quick preview (first PDF page). For other pages, exact spreadsheet values, full documents or dimensions, call open_original and run its command in your code sandbox, then read the file with your own tools. For long extracted texts use read_file_text (in parts). Say when you could only see part of a source.
 - Company records cannot be changed, sent or approved through this connector (only notes, conversations, project spaces and files in _CLAUDE/_PROJECTS are written); secrets (keys, tokens, pairing codes) are never shown.`;
 
@@ -569,14 +569,29 @@ async function handle(m: Rpc, token: string, email: string, session: string | nu
       const slim = name === 'save_chat' ? { ...args, final_answer: `[${String(args.final_answer ?? '').length} chars]` } : name === 'save_file' ? { ...args, text: args.text ? `[${String(args.text).length} chars]` : undefined, content_base64: args.content_base64 ? `[${String(args.content_base64).length} chars]` : undefined } : args;
       const logged = JSON.stringify(slim).length > 4000 ? { truncated: JSON.stringify(slim).slice(0, 4000) } : slim;
       await sqlApp`select mcp.log_call(${token}, ${name}, ${sqlApp.json(logged as never)}::jsonb, ${Date.now() - t0}, ${!error}, ${error})`.catch(() => undefined);
-      // First project test (23 Nov): Claude.ai loads tools on demand, so a Claude not told about a project never found
-      // project_open. Results of a conversation not tied to a project name the project spaces.
+      // Project context without any instruction from the person (owner, 23 Nov: "kita bisa skip bagian ini?"): the first
+      // result of a conversation carries the default project's INSTRUCTIONS + BRIEF (once per conversation); calls that
+      // carry no conversation get the short list of project spaces. First in the result: Haiku read past a hint at the end.
       if (!PROJECT_TOOLS.has(name) && name !== 'save_chat' && !error && Array.isArray(res.content)) {
         try {
-          const [{ h }] = (await sqlApp`select mcp.project_hint(${token}, ${turn.chat}::uuid) as h`) as unknown as { h: string | null }[];
-          // First in the result: Haiku in the second test read past a hint placed at the end.
-          if (h) res.content.unshift({ type: 'text', text: `[Before answering: TalaStudio keeps project spaces: ${h}. If the question is about one of them (status, versions, decisions, plans, documents, who did what), call project_open with its id first and answer from it: it holds that project's instructions, brief, decisions, documents and hand-overs.]` });
-        } catch { /* a hint must not break the tool */ }
+          if (turn.chat) {
+            const [{ c }] = (await sqlApp`select mcp.project_context(${token}, ${turn.chat}::uuid) as c`) as unknown as { c: unknown }[];
+            const ctx = (typeof c === 'string' ? JSON.parse(c) : c) as { default_project?: string; name?: string; instructions?: string | null; brief?: string | null; documents?: string | null; other_projects?: string | null; projects?: string | null } | null;
+            if (ctx?.default_project) {
+              res.content.unshift({ type: 'text', text: redact([
+                `[TalaStudio project context, sent once per conversation: the default project of this person is "${ctx.default_project}" (${ctx.name}). Use it when the question concerns it; follow its INSTRUCTIONS; open documents with project_read and sources with open_original. When you did project work, finish with session_end (project "${ctx.default_project}"). Other projects: ${ctx.other_projects ?? 'none'} (project_open to switch).]`,
+                ctx.instructions ? `--- INSTRUCTIONS ---\n${ctx.instructions}` : '',
+                ctx.brief ? `--- BRIEF ---\n${ctx.brief}` : '',
+                ctx.documents ? `--- Documents (project_read) ---\n${ctx.documents}` : '',
+              ].filter(Boolean).join('\n\n')) });
+            } else if (ctx?.projects) {
+              res.content.unshift({ type: 'text', text: `[TalaStudio project spaces: ${ctx.projects}. If the question is about one of them, call project_open with its id first.]` });
+            }
+          } else {
+            const [{ h }] = (await sqlApp`select mcp.project_hint(${token}, null::uuid) as h`) as unknown as { h: string | null }[];
+            if (h) res.content.unshift({ type: 'text', text: `[TalaStudio project spaces: ${h}. If the question is about one of them (status, versions, decisions, plans, documents), call project_open with its id first.]` });
+          }
+        } catch { /* project context must not break the tool */ }
       }
       // First real use (20 Nov): Claude sent the user's messages but never its own answers. Every result reminds it
       // to finish the turn with save_chat, so the last answer is kept too.
