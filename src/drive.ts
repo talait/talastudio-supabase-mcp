@@ -3,6 +3,7 @@ import { ensureFolder, putChunk, startResumable } from './james/google';
 
 /**
  * Files from Claude chats go to Drive TALASTUDIO ASSETS/_CLAUDE/<person>/<YYYY-MM-DD WIB>/ as they are (no conversion),
+ * or, when they belong to a project space, to TALASTUDIO ASSETS/_PROJECTS/<project>/files/ (decision 23 Nov 2026),
  * uploaded by the workspace service account, then logged in mcp.saved_files. The Drive sync picks them up like any
  * other file in the Shared Drive, so their content becomes searchable for James and everyone. Files are never
  * overwritten: saving the same name again makes a new file next to the old one.
@@ -27,27 +28,28 @@ export function mimeFor(name: string, given?: string | null): string {
   return (given && /^[\w.+-]+\/[\w.+-]+$/.test(given) && given !== 'application/octet-stream' ? given : MIME[ext]) ?? given ?? 'application/octet-stream';
 }
 
-/** Upload bytes (or a stream of known length) to _CLAUDE/<person>/<YYYY-MM-DD WIB>/ in the upload Shared Drive. */
-export async function uploadToClaudeFolder(target: { email: string; drive_id: string; drive_root: string }, o: {
+/** Upload bytes (or a stream of known length) to _CLAUDE/<person>/<YYYY-MM-DD WIB>/ (or _PROJECTS/<project>/files/) in the upload Shared Drive. */
+export async function uploadToClaudeFolder(target: { email: string; drive_id: string; drive_root: string; project?: string | null }, o: {
   name: string; mime: string; size: number; body: ReadableStream<Uint8Array> | ArrayBuffer; kind: 'input' | 'output'; description?: string | null;
 }) {
   if (!target?.drive_id || !target.drive_root) throw new Error('The upload folder is not configured (upload.drive_id / upload.drive_root).');
   const person = target.email.split('@')[0];
   const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
+  const path = target.project ? ['_PROJECTS', target.project, 'files'] : ['_CLAUDE', person, day];
   let parent = target.drive_root;
-  for (const f of ['_CLAUDE', person, day]) parent = await ensureFolder(f, parent, target.drive_id);
+  for (const f of path) parent = await ensureFolder(f, parent, target.drive_id);
   const session = await startResumable({
     name: o.name, mime: o.mime, size: o.size, parentId: parent,
     description: `${o.kind === 'input' ? 'Given to Claude by' : 'Made by Claude for'} ${target.email} through the TalaStudio connector.${o.description ? `\n${o.description.slice(0, 1500)}` : ''}`,
-    appProperties: { ts_source: 'claude_connector', ts_by: target.email.slice(0, 100), ts_kind: o.kind },
+    appProperties: { ts_source: 'claude_connector', ts_by: target.email.slice(0, 100), ts_kind: o.kind, ...(target.project ? { ts_project: target.project } : {}) },
   });
   const r = await putChunk(session, o.body, 0, o.size, o.size);
   if (!('file' in r)) throw new Error('Google Drive did not finish the upload.');
-  return { file: r.file, folder: `TALASTUDIO ASSETS/_CLAUDE/${person}/${day}` };
+  return { file: r.file, folder: `TALASTUDIO ASSETS/${path.join('/')}` };
 }
 
 export async function saveFile(token: string, a: {
-  name: string; text?: string; content_base64?: string; mime?: string; kind?: string; description?: string; chat_key?: string;
+  name: string; text?: string; content_base64?: string; mime?: string; kind?: string; description?: string; chat_key?: string; project?: string | null;
 }): Promise<SavedFile> {
   const name = cleanName(a.name);
   if (!name) throw new Error('Give the file a name with its extension, e.g. "vendor-risk.md".');
@@ -65,12 +67,20 @@ export async function saveFile(token: string, a: {
 
   const [{ t }] = (await sqlApp`select mcp.upload_target(${token}) as t`) as unknown as { t: unknown }[];
   const target = (typeof t === 'string' ? JSON.parse(t) : t) as { email: string; drive_id: string; drive_root: string };
-  const { file: f, folder } = await uploadToClaudeFolder(target, {
+  const project = a.project ? await projectSlug(token, a.project) : null;
+  const { file: f, folder } = await uploadToClaudeFolder({ ...target, project }, {
     name, mime, size: bytes.byteLength, kind, description: a.description,
     body: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
   });
   const [{ id }] = (await sqlApp`select mcp.file_saved(${token}, ${kind}, ${name}, ${mime}, ${bytes.byteLength}, ${target.drive_id},
     ${f.id}, ${f.webViewLink ?? null}, ${a.description ?? null}, ${a.chat_key ?? null}) as id`) as unknown as { id: number }[];
+  if (project) await sqlApp`select mcp.file_project(${token}, ${id}, ${project})`;
   return { id, name: f.name, link: f.webViewLink, drive_file: f.id, folder, size: bytes.byteLength };
 }
 
+
+/** The project's id as stored (checks that the project exists before anything is uploaded). */
+export async function projectSlug(token: string, project: string): Promise<string> {
+  const [{ s }] = (await sqlApp`select mcp.project_check(${token}, ${project}) as s`) as unknown as { s: string }[];
+  return s;
+}

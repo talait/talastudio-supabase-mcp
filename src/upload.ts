@@ -12,7 +12,7 @@ import { cleanName, mimeFor, uploadToClaudeFolder } from './drive';
  */
 const MAX_BYTES = 95 * 1024 * 1024; // the Worker accepts request bodies up to 100 MB
 
-type Ticket = { id: number; email: string; name: string; kind: 'input' | 'output'; description: string | null; chat_id: string | null; drive_id: string; drive_root: string };
+type Ticket = { id: number; email: string; name: string; kind: 'input' | 'output'; description: string | null; chat_id: string | null; project: string | null; drive_id: string; drive_root: string };
 
 const parse = <T>(v: unknown): T | null => (v == null ? null : ((typeof v === 'string' ? JSON.parse(v) : v) as T));
 const answer = (body: unknown, status = 200) => Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } });

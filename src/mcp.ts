@@ -1,17 +1,20 @@
 import { sql, sqlApp, ownerQuery } from './db';
 import { filePreview, runTool, tools as jamesTools } from './james/tools';
 import { CORS, MCP_ORIGIN, hideSecretKeys, json, redact } from './lib';
-import { saveFile } from './drive';
+import { projectSlug, saveFile } from './drive';
+import { openOriginal } from './download';
 
 /**
  * TalaStudio MCP server (Streamable HTTP, JSON responses, stateless) for the owners' Claude accounts.
  * Same tools and data as James (as an admin), plus free read-only SQL over every data schema. Nothing can be changed.
  */
 
-const VERSION = '2026-11-20.11';
+const VERSION = '2026-11-23.1';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 // Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
 const OUT_CHARS = 60_000;
+// Long documents and file texts are read in parts of this size (project_read, read_file_text).
+const PART_CHARS = 45_000;
 
 // James tools that only read. remember/forget/run_sync (write) and query_database (replaced by sql_query) are left out.
 const FROM_JAMES = ['overview', 'search', 'meaning_search', 'business_trace', 'knowledge_graph', 'timeline', 'recent', 'get_item',
@@ -75,8 +78,93 @@ const OWN_TOOLS: Tool[] = [
   {
     name: 'look_at_file',
     title: 'Look at a file',
-    description: 'Get the picture of an image, render, drawing or PDF (first page) so you can look at it yourself: colour/finish checks, defects in production photos, what a drawing shows, comparing a render with a sample. id = a file result_id (uuid) from search/timeline/pc_files/get_item, or a Google Drive file id.',
+    description: 'Get the picture of an image, render, drawing or PDF so you can look at it yourself: colour/finish checks, defects in production photos, what a drawing shows, comparing a render with a sample. id = a file result_id (uuid) from search/timeline/pc_files/get_item/project_open, or a Google Drive file id. The quick preview is the first page; for another page give page (the result then gives the command to render that page from the original in your code sandbox). For exact spreadsheet values or a whole document use open_original.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' }, page: { type: 'integer', minimum: 1, description: 'PDF page to look at (default 1).' } }, required: ['id'] },
+  },
+  {
+    name: 'project_list',
+    title: 'Project spaces',
+    description: 'List the project spaces kept in TalaStudio: one shared context per project (instructions, brief, documents, decisions, hand-overs, files) that every connected Claude account opens the same way. Use it when the user mentions a project and you do not know its id.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'project_open',
+    title: 'Open a project (call at the start)',
+    description: 'Open a project space at the START of a conversation about that project (when the user names it, or the instructions of the Claude Project say so). Returns the current INSTRUCTIONS (follow them), the BRIEF (where the project stands), the list of documents, recent decisions, the last hand-overs from other people\'s Claude conversations, the project files, and what changed since your last visit. Ties this conversation to the project. Read full documents with project_read; open the sources they link before relying on them.',
+    inputSchema: { type: 'object', properties: { project: { type: 'string', description: 'Project id from project_list, e.g. "talastudio-supabase".' } }, required: ['project'] },
+  },
+  {
+    name: 'project_read',
+    title: 'Read a project document',
+    description: 'Read one document of a project space in full: INSTRUCTIONS, BRIEF or a working document listed by project_open. Long documents come in parts (part 1, 2, …: the result says how many). Give version to read an older version; the result lists the history.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string' },
+        doc: { type: 'string', description: 'Document name, e.g. "INSTRUCTIONS", "BRIEF", "spec", "docs/pricing".' },
+        version: { type: 'integer', minimum: 1, description: 'Older version (default: current).' },
+        part: { type: 'integer', minimum: 1, description: 'Part of a long document (default 1).' },
+      },
+      required: ['project', 'doc'],
+    },
+  },
+  {
+    name: 'project_write',
+    title: 'Save a project document',
+    description: 'Save a project document as a NEW version (nothing is overwritten; older versions stay readable). doc "INSTRUCTIONS" = how Claude works on this project; "BRIEF" = short current state (goal, status, next steps, key links); any other name = a working document (spec, plan, research, list). Write the full document, in markdown, with links to its sources. To start a new project, give a new project id plus project_name. Use it when the user asks to save/update project knowledge, or when a document you produced should be shared with the team.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'Project id: lowercase letters, numbers and dashes.' },
+        doc: { type: 'string' },
+        content: { type: 'string', description: 'The full document (markdown).' },
+        note: { type: 'string', description: 'One line: what changed in this version.' },
+        project_name: { type: 'string', description: 'Readable name; only needed to start a new project.' },
+      },
+      required: ['project', 'doc', 'content'],
+    },
+  },
+  {
+    name: 'project_decide',
+    title: 'Record a project decision',
+    description: 'Record one decision in the project\'s decision log (append-only): what was decided, why, and the source (link to the chat, file, email or message where it was decided). Use it whenever the user decides something about the project. One decision per call, plain words.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string' },
+        decision: { type: 'string' },
+        reason: { type: 'string' },
+        source: { type: 'string', description: 'Where it was decided or which evidence it rests on (links).' },
+      },
+      required: ['project', 'decision'],
+    },
+  },
+  {
+    name: 'session_end',
+    title: 'Hand over (end of work in a project)',
+    description: 'Before you finish a piece of work in a project conversation, write the hand-over for the next Claude (any account): what was done, what was decided, open questions, and where every source is (Drive links, table names, chat). Hand over with links to the sources, not a retold summary. Give brief = the updated BRIEF when the project state changed (saved as a new version). Files saved in this conversation are tied to the project. Call it at the end of a work session, and again later if more work follows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string' },
+        handoff: { type: 'string', description: 'Markdown: done, decided, sources (links), next steps.' },
+        open_items: { type: 'string', description: 'Open questions / to-dos, one per line.' },
+        brief: { type: 'string', description: 'Optional: the full updated BRIEF.' },
+      },
+      required: ['project', 'handoff'],
+    },
+  },
+  {
+    name: 'open_original',
+    title: 'Get the original file (for your code sandbox)',
+    description: 'Get a one-time address for the ORIGINAL of a company file (PDF, Excel, Word, image, drawing; Google Docs/Sheets/Slides are exported to PDF/XLSX) and the curl command to fetch it into your code sandbox. Use it when a preview is not enough: other PDF pages, every cell of a spreadsheet, a full document, exact dimensions on a drawing. Then read it with your own tools (pdftoppm to render a page and look at it, pdftotext, pandas/openpyxl). id = a file result_id (uuid) from search/get_item/project_open, or a Google Drive file id. The address works 3 times within 30 minutes.',
     inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+  },
+  {
+    name: 'read_file_text',
+    title: 'Read the full extracted text of a file',
+    description: 'Read the full text the ingestion extracted from a company file (PDF, Word, Excel, slides, transcripts), in parts when it is long (the result says how many parts). Use it when get_item shows only part of a file. id = a file result_id (uuid) from search/get_item. For pictures and layout use look_at_file; for the original bytes use open_original.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' }, part: { type: 'integer', minimum: 1 } }, required: ['id'] },
   },
   {
     name: 'remember',
@@ -104,6 +192,7 @@ const OWN_TOOLS: Tool[] = [
         kind: { type: 'string', enum: ['input', 'output'], description: 'input = given by the user; output = made by Claude.' },
         description: { type: 'string', description: 'One or two lines: what it is and which question it answers.' },
         chat_key: { type: 'string', description: 'The key returned by save_chat, to tie the file to this conversation.' },
+        project: { type: 'string', description: 'Project id (from project_list) when the file belongs to a project: it is saved in _PROJECTS/<project>/files and listed by project_open.' },
       },
       required: ['name'],
     },
@@ -128,6 +217,7 @@ const OWN_TOOLS: Tool[] = [
             required: ['name'],
           },
         },
+        project: { type: 'string', description: 'Project id (from project_list) when the files belong to a project: they go to _PROJECTS/<project>/files and are listed by project_open.' },
       },
       required: ['files'],
     },
@@ -161,7 +251,9 @@ const OWN_TOOLS: Tool[] = [
     },
   },
 ];
-const WRITE_TOOLS = new Set(['remember', 'forget', 'save_file', 'upload_attachment', 'save_chat']);
+const WRITE_TOOLS = new Set(['remember', 'forget', 'save_file', 'upload_attachment', 'save_chat', 'project_write', 'project_decide', 'session_end']);
+// Change no company record and only keep context (like keep_turn): marked read-only so clients need not ask every time.
+const CONTEXT_TOOLS = new Set(['keep_turn', 'project_open']);
 
 // Every tool call carries the conversation so far, so it is saved without relying on a separate call.
 const TURN_FIELDS = {
@@ -193,9 +285,9 @@ function toolList(): Tool[] {
     inputSchema: withTurn(t.inputSchema),
     // keep_turn changes no company record: like every tool it only keeps the conversation, so it is marked read-only
     // (clients may then run it without asking every time).
-    annotations: t.name === 'keep_turn' ? { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false } : WRITE_TOOLS.has(t.name)
+    annotations: CONTEXT_TOOLS.has(t.name) ? { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false } : WRITE_TOOLS.has(t.name)
       ? { readOnlyHint: false, destructiveHint: t.name === 'forget', idempotentHint: false, openWorldHint: t.name === 'save_file' || t.name === 'upload_attachment' }
-      : { ...RO, ...(t.name === 'look_at_file' ? { openWorldHint: true } : {}) },
+      : { ...RO, ...(t.name === 'look_at_file' || t.name === 'open_original' ? { openWorldHint: true } : {}) },
   }));
 }
 
@@ -207,7 +299,9 @@ How to work:
 - Dates: the database stores UTC; report in WIB (Asia/Jakarta). Data is collected from 1 Nov 2026 (some sources earlier) and updated automatically; say how fresh the data is when it matters.
 - Cite the links returned by the tools. Never invent numbers: every figure comes from a tool result.
 - Shared context: every conversation is kept for the team, complete and append-only. In EVERY reply, whatever the user asks, call keep_turn first (with the attached files) and save_chat last. Every tool call carries chat_title, user_message (the user's latest message, word for word) and, on the first call of a turn, previous_answer (your previous answer, word for word). End every turn in which you used TalaStudio with save_chat(final_answer = your answer word for word). Save durable facts and decisions with remember (team). Earlier Claude conversations of the team: claude_chats. Files: for every file the user attaches (PDF, Excel, Word, image, drawing, anything) and every file you create in your code sandbox, call upload_attachment and run the curl commands it returns in your code sandbox, so the ORIGINAL file is kept in Drive and read by the ingestion; if the sandbox cannot reach the address, give the user the links to drop the files themselves. Text you write yourself (reports, tables, notes) goes with save_file. Files are never overwritten; share the Drive links. Do this without being asked; mention it in one short line at most.
-- Company records cannot be changed, sent or approved through this connector (only notes, chat summaries and files in _CLAUDE are written); secrets (keys, tokens, pairing codes) are never shown.`;
+- Project spaces: a project's shared context lives in TalaStudio and is the same for every Claude account (Claude Projects cannot be shared between accounts). When the conversation is about a project (the user names it, or the Claude Project's instructions say so), call project_open first and follow its INSTRUCTIONS; read documents with project_read; save documents with project_write (always a new version), decisions with project_decide, project files with upload_attachment/save_file + project. Before you finish a piece of work, call session_end with a hand-over and, when the state changed, the updated brief. Hand over with links to the sources (files, tables, chats), never a retold summary in their place; open the linked sources before relying on a hand-over.
+- Originals, not previews: look_at_file is a quick preview (first PDF page). For other pages, exact spreadsheet values, full documents or dimensions, call open_original and run its command in your code sandbox, then read the file with your own tools. For long extracted texts use read_file_text (in parts). Say when you could only see part of a source.
+- Company records cannot be changed, sent or approved through this connector (only notes, conversations, project spaces and files in _CLAUDE/_PROJECTS are written); secrets (keys, tokens, pairing codes) are never shown.`;
 
 async function contextText(token: string): Promise<string> {
   const [[{ s }], notes, know, [{ mine }]] = await Promise.all([
@@ -232,7 +326,7 @@ async function contextText(token: string): Promise<string> {
 type UploadReq = { name?: unknown; path?: unknown; kind?: unknown; description?: unknown };
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 /** One-time upload addresses + the curl command for each file (originals go to Drive _CLAUDE). */
-async function issueUploads(token: string, chat: string | null, list: UploadReq[]): Promise<string[]> {
+async function issueUploads(token: string, chat: string | null, list: UploadReq[], project: string | null = null): Promise<string[]> {
   const out: string[] = [];
   for (const f of list.slice(0, 20)) {
     const name = String(f.name ?? '').trim();
@@ -240,6 +334,7 @@ async function issueUploads(token: string, chat: string | null, list: UploadReq[
     const [{ r }] = (await sqlApp`select mcp.upload_ticket_new(${token}, ${name}, ${f.kind === 'output' ? 'output' : 'input'},
       ${typeof f.description === 'string' ? f.description : null}, ${chat}::uuid) as r`) as unknown as { r: unknown }[];
     const { ticket } = (typeof r === 'string' ? JSON.parse(r) : r) as { ticket: string };
+    if (project) await sqlApp`select mcp.upload_ticket_project(${token}, ${ticket}, ${project})`;
     const url = `${MCP_ORIGIN}/upload/${ticket}`;
     const path = typeof f.path === 'string' && f.path.trim() ? f.path.trim() : `/mnt/user-data/${f.kind === 'output' ? 'outputs' : 'uploads'}/${name}`;
     out.push(`${name}\n  command: curl -sS --fail-with-body -T ${shq(path)} ${shq(url)}\n  browser link (if the sandbox cannot connect): ${url}`);
@@ -268,7 +363,8 @@ async function callTool(name: string, args: Record<string, unknown>, token: stri
       return { content: [text(ok ? `Note #${args.id} removed.` : `No ${scope} note #${args.id} found.`)] };
     }
     case 'save_file': {
-      const f = await saveFile(token, { ...(args as Parameters<typeof saveFile>[1]), chat_key: typeof args.chat_key === 'string' && args.chat_key ? args.chat_key : turn.chat ?? undefined });
+      const f = await saveFile(token, { ...(args as Parameters<typeof saveFile>[1]), chat_key: typeof args.chat_key === 'string' && args.chat_key ? args.chat_key : turn.chat ?? undefined,
+        project: typeof args.project === 'string' && args.project.trim() ? args.project : null });
       return { content: [text(JSON.stringify({ saved: f.name, folder: f.folder, link: f.link, size_bytes: f.size }))] };
     }
     case 'claude_chats': {
@@ -287,9 +383,10 @@ async function callTool(name: string, args: Record<string, unknown>, token: stri
     case 'upload_attachment': {
       const list = (Array.isArray(args.files) ? args.files : []) as UploadReq[];
       if (!list.length) throw new ToolError('List the files: [{ name, path, kind }].');
-      const out = await issueUploads(token, turn.chat, list);
+      const project = typeof args.project === 'string' && args.project.trim() ? await projectSlug(token, args.project) : null;
+      const out = await issueUploads(token, turn.chat, list, project);
       // Not passed through redact(): these are our own one-time addresses, and Claude needs them intact.
-      return { content: [{ type: 'text', text: `${UPLOAD_HELP}\n\n${out.join('\n\n')}` }] };
+      return { content: [{ type: 'text', text: `${project ? `Files go to TALASTUDIO ASSETS/_PROJECTS/${project}/files.\n` : ''}${UPLOAD_HELP}\n\n${out.join('\n\n')}` }] };
     }
     case 'keep_turn': {
       const list = (Array.isArray(args.attached_files) ? args.attached_files : []) as UploadReq[];
@@ -332,11 +429,87 @@ async function callTool(name: string, args: Record<string, unknown>, token: stri
       const v = typeof r === 'string' ? r : JSON.stringify(r);
       return { content: [text(v.length > OUT_CHARS ? v.slice(0, OUT_CHARS) + '\n[CUT OFF: use a filter.]' : v)] };
     }
+    case 'project_list': {
+      const [{ r }] = (await sqlApp`select mcp.project_list(${token}) as r`) as unknown as { r: unknown }[];
+      const v = typeof r === 'string' ? r : JSON.stringify(r);
+      return { content: [text(v === '[]' ? 'No project spaces yet. Start one with project_write (project id + project_name), e.g. its INSTRUCTIONS or BRIEF.' : v)] };
+    }
+    case 'project_open': {
+      const [{ r }] = (await sqlApp`select mcp.project_open(${token}, ${String(args.project ?? '')}, ${turn.chat}::uuid) as r`) as unknown as { r: unknown }[];
+      const o = (typeof r === 'string' ? JSON.parse(r) : r) as Record<string, unknown> & { instructions?: { text?: string } | null; brief?: { text?: string } | null };
+      let v = JSON.stringify(o);
+      if (v.length > OUT_CHARS) {
+        // Keep the open small enough for every client: long INSTRUCTIONS/BRIEF are cut here and read in full with project_read.
+        for (const k of ['instructions', 'brief'] as const) {
+          const d = o[k];
+          if (d?.text && d.text.length > 15_000) d.text = `${d.text.slice(0, 15_000)}\n[CUT OFF: read the rest with project_read doc "${k.toUpperCase()}".]`;
+        }
+        v = JSON.stringify(o);
+        if (v.length > OUT_CHARS) v = v.slice(0, OUT_CHARS) + '\n[CUT OFF: use project_read for the documents.]';
+      }
+      return { content: [text(`${v}\n\nFollow the INSTRUCTIONS above. Before relying on a hand-over or decision, open the sources it links. End the work with session_end.`)] };
+    }
+    case 'project_read': {
+      const ver = typeof args.version === 'number' ? Math.floor(args.version) : null;
+      const [{ r }] = (await sqlApp`select mcp.project_read(${token}, ${String(args.project ?? '')}, ${String(args.doc ?? '')}, ${ver}::int) as r`) as unknown as { r: unknown }[];
+      const o = (typeof r === 'string' ? JSON.parse(r) : r) as Record<string, unknown> & { content: string };
+      const parts = Math.max(1, Math.ceil(o.content.length / PART_CHARS));
+      const part = Math.min(parts, Math.max(1, typeof args.part === 'number' ? Math.floor(args.part) : 1));
+      const body = o.content.slice((part - 1) * PART_CHARS, part * PART_CHARS);
+      const { content: _c, ...meta } = o;
+      return { content: [text(`${JSON.stringify({ ...meta, chars: o.content.length, part, parts })}\n\n--- ${o.doc} v${o.version}${parts > 1 ? ` (part ${part} of ${parts})` : ''} ---\n${body}${part < parts ? `\n\n[Part ${part} of ${parts}: read part ${part + 1} next.]` : ''}`)] };
+    }
+    case 'project_write': {
+      const [{ r }] = (await sqlApp`select mcp.project_write(${token}, ${String(args.project ?? '')}, ${String(args.doc ?? '')}, ${String(args.content ?? '')},
+        ${typeof args.note === 'string' ? args.note : null}, ${typeof args.project_name === 'string' ? args.project_name : null}, ${turn.chat}::uuid) as r`) as unknown as { r: unknown }[];
+      const o = (typeof r === 'string' ? JSON.parse(r) : r) as { project: string; doc: string; version: number; project_created: boolean };
+      return { content: [text(`${o.project_created ? `Project space "${o.project}" started. ` : ''}Saved ${o.doc} as version ${o.version} in project ${o.project} (older versions stay readable). Every connected Claude sees it with project_open.`)] };
+    }
+    case 'project_decide': {
+      const [{ id }] = (await sqlApp`select mcp.project_decide(${token}, ${String(args.project ?? '')}, ${String(args.decision ?? '')},
+        ${typeof args.reason === 'string' ? args.reason : null}, ${typeof args.source === 'string' ? args.source : null}, ${turn.chat}::uuid) as id`) as unknown as { id: number }[];
+      return { content: [text(`Decision #${id} recorded in project ${args.project}.`)] };
+    }
+    case 'session_end': {
+      const [{ r }] = (await sqlApp`select mcp.project_session_end(${token}, ${String(args.project ?? '')}, ${turn.chat}::uuid, ${String(args.handoff ?? '')},
+        ${typeof args.open_items === 'string' ? args.open_items : null}, ${typeof args.brief === 'string' ? args.brief : null}) as r`) as unknown as { r: unknown }[];
+      const o = (typeof r === 'string' ? JSON.parse(r) : r) as { project: string; session: number; brief_version: number | null; files_tied: number };
+      return { content: [text(`Hand-over #${o.session} saved in project ${o.project}${o.brief_version ? `; BRIEF is now version ${o.brief_version}` : ''}${o.files_tied ? `; ${o.files_tied} file(s) of this conversation tied to the project` : ''}. The next Claude that opens the project sees it.`)] };
+    }
+    case 'open_original': {
+      const o = await openOriginal(token, email, String(args.id ?? '').trim());
+      const dest = `/tmp/${o.name.replace(/[^\w.() -]+/g, '_')}`;
+      const tips = /pdf/.test(o.mime) ? `pdfinfo for the page count; pdftoppm -png -r 110 -f N -l N ${shq(dest)} /tmp/page to render page N, then look at the PNG; pdftotext -layout for the text.`
+        : /sheet|excel|csv/.test(o.mime) ? 'Read every sheet with pandas (pd.read_excel(path, sheet_name=None)) or openpyxl for formulas and formatting.'
+        : /^image\//.test(o.mime) ? 'Look at it at full resolution with your file viewer.' : 'Read it with the tool that fits the format.';
+      // Not passed through redact(): our own one-time address, Claude needs it intact.
+      return { content: [{ type: 'text', text: `${o.name} (${o.mime}${o.size ? `, ${(o.size / 1048576).toFixed(1)} MB` : ''}${o.exported ? ', exported from Google' : ''})${o.link ? `\nDrive: ${o.link}` : ''}\nRun in your code sandbox:\n\ncurl -sS --fail-with-body -o ${shq(dest)} ${shq(o.url)}\n\nThen: ${tips}\nThe address works 3 times within 30 minutes. If the sandbox cannot connect, say so and use look_at_file / read_file_text instead.` }] };
+    }
+    case 'read_file_text': {
+      const id = String(args.id ?? '').trim();
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new ToolError('id is a file result_id (uuid) from search/get_item.');
+      const rows = (await ownerQuery(token, `select f.title, f.mime, f.data ->> 'path' as path, c.content_kind, c.summary, c.text, length(c.text) as chars
+        from media.files f join media.file_contents c on c.file_id = f.id and c.is_current where f.id = '${id}' and f.deleted_at is null
+        order by length(c.text) desc nulls last`, 5)) as { title: string; mime: string; path: string | null; content_kind: string; summary: string | null; text: string | null; chars: number | null }[];
+      if (!rows.length || !rows[0].text) throw new ToolError('No extracted text for this file (not read yet, a picture, or an HR document). Try look_at_file or open_original.');
+      const t0 = rows[0].text;
+      const parts = Math.max(1, Math.ceil(t0.length / PART_CHARS));
+      const part = Math.min(parts, Math.max(1, typeof args.part === 'number' ? Math.floor(args.part) : 1));
+      return { content: [text(`${JSON.stringify({ file: rows[0].title, mime: rows[0].mime, path: rows[0].path, kind: rows[0].content_kind, chars: t0.length, part, parts })}\n\n${t0.slice((part - 1) * PART_CHARS, part * PART_CHARS)}${part < parts ? `\n\n[Part ${part} of ${parts}: read part ${part + 1} next.]` : ''}`)] };
+    }
     case 'look_at_file': {
+      const page = typeof args.page === 'number' ? Math.floor(args.page) : 1;
+      if (page > 1) {
+        // Drive previews only show page 1: render the asked page from the original in Claude's sandbox.
+        const o = await openOriginal(token, email, String(args.id ?? '').trim());
+        if (!/pdf/.test(o.mime)) throw new ToolError(`${o.name} is not a PDF (${o.mime}); look_at_file without page shows it.`);
+        const f = `/tmp/ts_${Date.now().toString(36)}.pdf`;
+        return { content: [{ type: 'text', text: `${o.name}: page ${page} is rendered from the original in your code sandbox. Run this in one bash call, then look at the PNG (e.g. with your file viewer):\n\ncurl -sS --fail-with-body -o ${shq(f)} ${shq(o.url)} && pdftoppm -png -r 110 -f ${page} -l ${page} ${shq(f)} /tmp/page_${page} && ls /tmp/page_${page}*.png\n\n(pdfinfo ${shq(f)} gives the page count. The address works 3 times within 30 minutes. If the sandbox cannot connect, say so: the user can open ${o.link ?? 'the file in Drive'}.)` }] };
+      }
       const p = await filePreview(String(args.id ?? '').trim(), email);
       return {
         content: [
-          text(`File: ${p.name} (${p.mime})${p.link ? `\nLink: ${p.link}` : ''}\n${/pdf|presentation|document/.test(p.mime) ? 'First page preview' : 'Preview image (1600 px)'}:`),
+          text(`File: ${p.name} (${p.mime})${p.link ? `\nLink: ${p.link}` : ''}\n${/pdf|presentation|document/.test(p.mime) ? 'First page preview (other pages: look_at_file with page; whole file: open_original)' : 'Preview image (1600 px; full resolution: open_original)'}:`),
           { type: 'image', data: p.data, mimeType: p.type },
         ],
       };
