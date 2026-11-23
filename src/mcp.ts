@@ -9,7 +9,7 @@ import { openOriginal } from './download';
  * Same tools and data as James (as an admin), plus free read-only SQL over every data schema. Nothing can be changed.
  */
 
-const VERSION = '2026-11-23.2';
+const VERSION = '2026-11-23.3';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 // Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
 const OUT_CHARS = 60_000;
@@ -90,7 +90,7 @@ const OWN_TOOLS: Tool[] = [
   {
     name: 'project_open',
     title: 'Open a project (call at the start)',
-    description: 'Open a project space at the START of a conversation about that project (when the user names it, or the instructions of the Claude Project say so). Returns the current INSTRUCTIONS (follow them), the BRIEF (where the project stands), the list of documents, recent decisions, the last hand-overs from other people\'s Claude conversations, the project files, and what changed since your last visit. Ties this conversation to the project. Read full documents with project_read; open the sources they link before relying on them.',
+    description: 'Project status, latest version, brief, decisions, plans, documents and hand-overs of a TalaStudio project (e.g. talastudio-supabase: the data platform, Claude connector, TalaStudio Upload app, James, workspace). Open a project space at the START of a conversation about that project (when the user names it, or the instructions of the Claude Project say so). Returns the current INSTRUCTIONS (follow them), the BRIEF (where the project stands), the list of documents, recent decisions, the last hand-overs from other people\'s Claude conversations, the project files, and what changed since your last visit. Ties this conversation to the project. Read full documents with project_read; open the sources they link before relying on them.',
     inputSchema: { type: 'object', properties: { project: { type: 'string', description: 'Project id from project_list, e.g. "talastudio-supabase".' } }, required: ['project'] },
   },
   {
@@ -574,7 +574,8 @@ async function handle(m: Rpc, token: string, email: string, session: string | nu
       if (!PROJECT_TOOLS.has(name) && name !== 'save_chat' && !error && Array.isArray(res.content)) {
         try {
           const [{ h }] = (await sqlApp`select mcp.project_hint(${token}, ${turn.chat}::uuid) as h`) as unknown as { h: string | null }[];
-          if (h) res.content.push({ type: 'text', text: `[TalaStudio project spaces: ${h}. If this conversation is about one of them, call project_open with its id first: it holds that project's instructions, brief, decisions, documents and hand-overs.]` });
+          // First in the result: Haiku in the second test read past a hint placed at the end.
+          if (h) res.content.unshift({ type: 'text', text: `[Before answering: TalaStudio keeps project spaces: ${h}. If the question is about one of them (status, versions, decisions, plans, documents, who did what), call project_open with its id first and answer from it: it holds that project's instructions, brief, decisions, documents and hand-overs.]` });
         } catch { /* a hint must not break the tool */ }
       }
       // First real use (20 Nov): Claude sent the user's messages but never its own answers. Every result reminds it

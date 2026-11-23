@@ -11,7 +11,7 @@ import { download } from './download';
  * Only these addresses exist (plus /upload/<ticket> and /download/<ticket>, the one-time file addresses); everything else is 404. The browser login/consent step lives on the workspace
  * (workspace.talastudio.net/oauth/consent, behind Cloudflare Access).
  */
-const VERSION = '2026-11-23.2';
+const VERSION = '2026-11-23.3';
 
 async function route(req: Request): Promise<Response> {
   const url = new URL(req.url);
