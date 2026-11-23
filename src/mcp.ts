@@ -9,7 +9,7 @@ import { openOriginal } from './download';
  * Same tools and data as James (as an admin), plus free read-only SQL over every data schema. Nothing can be changed.
  */
 
-const VERSION = '2026-11-23.1';
+const VERSION = '2026-11-23.2';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 // Claude Code caps MCP tool output at about 25k tokens by default: stay under it.
 const OUT_CHARS = 60_000;
@@ -254,6 +254,7 @@ const OWN_TOOLS: Tool[] = [
 const WRITE_TOOLS = new Set(['remember', 'forget', 'save_file', 'upload_attachment', 'save_chat', 'project_write', 'project_decide', 'session_end']);
 // Change no company record and only keep context (like keep_turn): marked read-only so clients need not ask every time.
 const CONTEXT_TOOLS = new Set(['keep_turn', 'project_open']);
+const PROJECT_TOOLS = new Set(['project_list', 'project_open', 'project_read', 'project_write', 'project_decide', 'session_end']);
 
 // Every tool call carries the conversation so far, so it is saved without relying on a separate call.
 const TURN_FIELDS = {
@@ -568,6 +569,14 @@ async function handle(m: Rpc, token: string, email: string, session: string | nu
       const slim = name === 'save_chat' ? { ...args, final_answer: `[${String(args.final_answer ?? '').length} chars]` } : name === 'save_file' ? { ...args, text: args.text ? `[${String(args.text).length} chars]` : undefined, content_base64: args.content_base64 ? `[${String(args.content_base64).length} chars]` : undefined } : args;
       const logged = JSON.stringify(slim).length > 4000 ? { truncated: JSON.stringify(slim).slice(0, 4000) } : slim;
       await sqlApp`select mcp.log_call(${token}, ${name}, ${sqlApp.json(logged as never)}::jsonb, ${Date.now() - t0}, ${!error}, ${error})`.catch(() => undefined);
+      // First project test (23 Nov): Claude.ai loads tools on demand, so a Claude not told about a project never found
+      // project_open. Results of a conversation not tied to a project name the project spaces.
+      if (!PROJECT_TOOLS.has(name) && name !== 'save_chat' && !error && Array.isArray(res.content)) {
+        try {
+          const [{ h }] = (await sqlApp`select mcp.project_hint(${token}, ${turn.chat}::uuid) as h`) as unknown as { h: string | null }[];
+          if (h) res.content.push({ type: 'text', text: `[TalaStudio project spaces: ${h}. If this conversation is about one of them, call project_open with its id first: it holds that project's instructions, brief, decisions, documents and hand-overs.]` });
+        } catch { /* a hint must not break the tool */ }
+      }
       // First real use (20 Nov): Claude sent the user's messages but never its own answers. Every result reminds it
       // to finish the turn with save_chat, so the last answer is kept too.
       if (name !== 'save_chat' && name !== 'keep_turn' && Array.isArray(res.content)) {
